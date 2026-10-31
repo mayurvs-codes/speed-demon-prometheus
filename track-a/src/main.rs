@@ -1,0 +1,277 @@
+// Track A: Ingest.
+// The log is mapped and cut into one chunk per thread. Each thread reduces its lines to compact
+// records (endpoint, hour, latency, error flag). Records are then counting-sorted into one bucket
+// per (hour, endpoint); percentiles come from select_nth_unstable inside each bucket, and each
+// thread formats a range of hours so the output is simply the hours in order.
+use std::fs::File;
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::thread;
+
+const HOURS: usize = 72;
+
+extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+}
+
+/// Maps a file read-only into memory (std has no mmap, so this declares the libc call).
+fn map(path: &str) -> Option<&'static [u8]> {
+    let f = File::open(path).ok()?;
+    let len = f.metadata().ok()?.len() as usize;
+    if len == 0 {
+        return None;
+    }
+    // PROT_READ, MAP_PRIVATE | MAP_POPULATE
+    let p = unsafe { mmap(std::ptr::null_mut(), len, 1, 0x2 | 0x8000, f.as_raw_fd(), 0) };
+    (p as isize != -1).then(|| unsafe { std::slice::from_raw_parts(p, len) })
+}
+
+fn hash64(bytes: &[u8]) -> u64 {
+    let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ (bytes.len() as u64).wrapping_mul(0xA24B_AED4_963E_E407);
+    let mut words = bytes.chunks_exact(8);
+    for w in &mut words {
+        h = (h ^ u64::from_le_bytes(w.try_into().unwrap())).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        h ^= h >> 32;
+    }
+    let mut last = [0u8; 8];
+    last[..words.remainder().len()].copy_from_slice(words.remainder());
+    h = (h ^ u64::from_le_bytes(last)).wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+    h ^ (h >> 29)
+}
+
+#[derive(Clone, Copy)]
+struct Rec {
+    endpoint: u32, // thread-local id, later replaced by the bucket number
+    latency: u32,
+    hour: u8,
+    server_error: u8,
+}
+
+/// Open-addressing set of endpoint strings, assigning dense ids in first-seen order.
+struct Dict {
+    slots: Vec<(u64, u32)>, // (hash, id + 1); 0 = empty
+    names: Vec<&'static [u8]>,
+}
+
+impl Dict {
+    fn new() -> Self {
+        Dict { slots: vec![(0, 0); 8192], names: Vec::new() }
+    }
+
+    fn id(&mut self, name: &'static [u8]) -> u32 {
+        if self.names.len() * 2 > self.slots.len() {
+            self.grow();
+        }
+        let h = hash64(name);
+        let mask = self.slots.len() - 1;
+        let mut i = h as usize & mask;
+        loop {
+            match self.slots[i] {
+                (0, 0) => {
+                    self.slots[i] = (h, self.names.len() as u32 + 1);
+                    self.names.push(name);
+                    return self.names.len() as u32 - 1;
+                }
+                (sh, sid) if sh == h && self.names[sid as usize - 1] == name => return sid - 1,
+                _ => i = (i + 1) & mask,
+            }
+        }
+    }
+
+    fn grow(&mut self) {
+        let mut slots = vec![(0, 0); self.slots.len() * 2];
+        let mask = slots.len() - 1;
+        for (id, name) in self.names.iter().enumerate() {
+            let h = hash64(name);
+            let mut i = h as usize & mask;
+            while slots[i].1 != 0 {
+                i = (i + 1) & mask;
+            }
+            slots[i] = (h, id as u32 + 1);
+        }
+        self.slots = slots;
+    }
+}
+
+struct Chunk {
+    recs: Vec<Rec>,
+    dict: Dict,
+}
+
+fn digit(b: u8) -> usize {
+    usize::from(b - b'0')
+}
+
+fn read_chunk(d: &'static [u8], mut at: usize, end: usize) -> Chunk {
+    let mut c = Chunk { recs: Vec::with_capacity((end - at) / 70 + 16), dict: Dict::new() };
+    while at < end {
+        // "YYYY-MM-DDTHH:MM:SS.ffffffZ " is 28 bytes; the hour index is counted from 2026-10-30T18.
+        let month = digit(d[at + 5]) * 10 + digit(d[at + 6]);
+        let day = digit(d[at + 8]) * 10 + digit(d[at + 9]);
+        let hour_of_day = digit(d[at + 11]) * 10 + digit(d[at + 12]);
+        let day_index = if month == 10 { day - 30 } else { day + 1 };
+        let hour = (day_index * 24 + hour_of_day - 18) as u8;
+        at += 28;
+        while d[at] != b' ' {
+            at += 1; // method
+        }
+        at += 1;
+        let name_start = at;
+        while d[at] != b' ' {
+            at += 1;
+        }
+        let name = &d[name_start..at];
+        at += 1;
+        let server_error = u8::from(d[at] == b'5');
+        at += 4;
+        let mut latency = 0u32;
+        while d[at] != b'\n' {
+            latency = latency * 10 + u32::from(d[at] - b'0');
+            at += 1;
+        }
+        at += 1;
+        let endpoint = c.dict.id(name);
+        c.recs.push(Rec { endpoint, latency, hour, server_error });
+    }
+    c
+}
+
+fn push_int(out: &mut Vec<u8>, mut v: u64) {
+    let mut digits = [0u8; 20];
+    let mut n = digits.len();
+    loop {
+        n -= 1;
+        digits[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[n..]);
+}
+
+/// "2026-10-30T18:00:00Z " for each of the 72 hours of the span.
+fn hour_labels() -> Vec<String> {
+    (0..HOURS)
+        .map(|h| {
+            let (day, hh) = ((h + 18) / 24, (h + 18) % 24);
+            let (month, dom) = match day {
+                0 => (10, 30),
+                1 => (10, 31),
+                _ => (11, day - 1),
+            };
+            format!("2026-{month:02}-{dom:02}T{hh:02}:00:00Z ")
+        })
+        .collect()
+}
+
+fn main() {
+    let Some(d) = map("/data/requests.log") else {
+        File::create("/out/summary.txt").expect("create output");
+        return;
+    };
+    let threads = thread::available_parallelism().map_or(1, |t| t.get()).clamp(1, 12);
+
+    let mut cut = vec![0usize; threads + 1];
+    cut[threads] = d.len();
+    for i in 1..threads {
+        let guess = (d.len() * i / threads).max(cut[i - 1]);
+        cut[i] = d[guess..].iter().position(|&c| c == b'\n').map_or(d.len(), |k| guess + k + 1);
+    }
+    let mut chunks: Vec<Chunk> = thread::scope(|sc| {
+        let cut = &cut;
+        let jobs: Vec<_> = (0..threads).map(|i| sc.spawn(move || read_chunk(d, cut[i], cut[i + 1]))).collect();
+        jobs.into_iter().map(|j| j.join().unwrap()).collect()
+    });
+
+    // One global, byte-ordered endpoint list; its index is the endpoint's rank within an hour.
+    let mut endpoints: Vec<&[u8]> = chunks.iter().flat_map(|c| c.dict.names.iter().copied()).collect();
+    endpoints.sort_unstable();
+    endpoints.dedup();
+    let width = endpoints.len();
+    let buckets = HOURS * width;
+
+    // Counting sort of the latencies into buckets; error counts are tallied on the way.
+    let mut begin = vec![0u32; buckets + 1];
+    let mut errors = vec![0u32; buckets];
+    for c in chunks.iter_mut() {
+        let rank: Vec<u32> = c.dict.names.iter().map(|n| endpoints.binary_search(n).unwrap() as u32).collect();
+        for r in c.recs.iter_mut() {
+            let b = r.hour as usize * width + rank[r.endpoint as usize] as usize;
+            r.endpoint = b as u32;
+            begin[b + 1] += 1;
+            errors[b] += u32::from(r.server_error);
+        }
+    }
+    for b in 0..buckets {
+        begin[b + 1] += begin[b];
+    }
+    let mut latencies = vec![0u32; begin[buckets] as usize];
+    let mut fill = begin[..buckets].to_vec();
+    for c in &chunks {
+        for r in &c.recs {
+            let slot = &mut fill[r.endpoint as usize];
+            latencies[*slot as usize] = r.latency;
+            *slot += 1;
+        }
+    }
+    drop(fill);
+
+    // Each thread takes a run of hours: its latency range and output slots are disjoint.
+    let labels = hour_labels();
+    let mut hour_out: Vec<Vec<u8>> = vec![Vec::new(); HOURS];
+    {
+        let (begin, errors, endpoints, labels) = (&begin, &errors, &endpoints, &labels);
+        let mut lat_left: &mut [u32] = &mut latencies;
+        let mut out_left: &mut [Vec<u8>] = &mut hour_out;
+        thread::scope(|sc| {
+            for t in 0..threads {
+                let (h0, h1) = (HOURS * t / threads, HOURS * (t + 1) / threads);
+                let (lat, rest) = std::mem::take(&mut lat_left).split_at_mut((begin[h1 * width] - begin[h0 * width]) as usize);
+                lat_left = rest;
+                let (outs, rest) = std::mem::take(&mut out_left).split_at_mut(h1 - h0);
+                out_left = rest;
+                let base = begin[h0 * width] as usize;
+                sc.spawn(move || {
+                    for (h, out) in (h0..h1).zip(outs.iter_mut()) {
+                        for (e, endpoint) in endpoints.iter().enumerate() {
+                            let b = h * width + e;
+                            let (lo, hi) = (begin[b] as usize - base, begin[b + 1] as usize - base);
+                            let n = hi - lo;
+                            if n == 0 {
+                                continue;
+                            }
+                            let v = &mut lat[lo..hi];
+                            // Nearest rank: ceil(p * n / 100), 1-indexed.
+                            let rank = |p: usize| (p * n + 99) / 100;
+                            let (r50, r95, r99) = (rank(50), rank(95), rank(99));
+                            v.select_nth_unstable(r99 - 1);
+                            let p99 = v[r99 - 1];
+                            if r95 < r99 {
+                                v[..r99 - 1].select_nth_unstable(r95 - 1);
+                            }
+                            let p95 = v[r95 - 1];
+                            if r50 < r95 {
+                                v[..r95 - 1].select_nth_unstable(r50 - 1);
+                            }
+                            let p50 = v[r50 - 1];
+                            let errs = u64::from(errors[b]);
+                            out.extend_from_slice(labels[h].as_bytes());
+                            out.extend_from_slice(endpoint);
+                            for x in [n as u64, u64::from(p50), u64::from(p95), u64::from(p99), errs, errs * 1_000_000 / n as u64] {
+                                out.push(b' ');
+                                push_int(out, x);
+                            }
+                            out.push(b'\n');
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    let mut f = File::create("/out/summary.txt").expect("create output");
+    for out in &hour_out {
+        f.write_all(out).expect("write output");
+    }
+}
