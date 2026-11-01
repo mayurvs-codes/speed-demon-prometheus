@@ -53,10 +53,8 @@ fn hash64(bytes: &[u8]) -> u64 {
 
 #[derive(Clone, Copy)]
 struct Rec {
-    endpoint: u32, // thread-local id, later replaced by the bucket number
+    meta: u32, // thread-local endpoint id (24 bits), hour (7 bits), 5xx flag (1 bit); later replaced by the bucket number
     latency: u32,
-    hour: u8,
-    server_error: u8,
 }
 
 /// Open-addressing set of endpoint strings, assigning dense ids in first-seen order.
@@ -134,7 +132,7 @@ fn read_chunk(d: &'static [u8], mut at: usize, end: usize) -> Chunk {
     while at < end {
         // Behind us the pages are finished with: hand whole pages back (MADV_DONTNEED drops only this process's
         // mapping; the file stays in the page cache), so the input never sits fully resident.
-        if at - released >= 1 << 22 {
+        if at - released >= 1 << 19 {
             let (lo, hi) = ((released + 4095) & !4095, at & !4095);
             unsafe { madvise(d.as_ptr().add(lo) as *mut u8, hi - lo, 4) };
             released = at;
@@ -163,7 +161,7 @@ fn read_chunk(d: &'static [u8], mut at: usize, end: usize) -> Chunk {
         }
         at += 1;
         let endpoint = c.dict.id(name);
-        c.recs.push(Rec { endpoint, latency, hour, server_error });
+        c.recs.push(Rec { meta: endpoint | u32::from(hour) << 24 | u32::from(server_error) << 31, latency });
     }
     c
 }
@@ -235,10 +233,10 @@ fn main() {
                     let rank: Vec<u32> = c.dict.names.iter().map(|n| endpoints.binary_search(n).unwrap() as u32).collect();
                     let mut count = vec![[0u32; 2]; buckets];
                     for r in c.recs.iter_mut() {
-                        let b = r.hour as usize * width + rank[r.endpoint as usize] as usize;
-                        r.endpoint = b as u32;
+                        let b = (r.meta >> 24 & 127) as usize * width + rank[(r.meta & 0xFF_FFFF) as usize] as usize;
+                        count[b][1] += r.meta >> 31;
+                        r.meta = b as u32;
                         count[b][0] += 1;
-                        count[b][1] += u32::from(r.server_error);
                     }
                     count
                 })
@@ -295,7 +293,7 @@ fn main() {
             sc.spawn(move || {
                 let dst = dst;
                 for r in &c.recs {
-                    let slot = &mut p[r.endpoint as usize][0];
+                    let slot = &mut p[r.meta as usize][0];
                     // SAFETY: every (chunk, bucket) pair owns its own range of `latencies`, sized by its count.
                     unsafe { *dst.0.add(*slot as usize) = r.latency };
                     *slot += 1;
