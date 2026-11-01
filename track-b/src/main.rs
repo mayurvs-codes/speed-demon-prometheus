@@ -16,6 +16,7 @@ use std::thread;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
 /// Maps a file read-only into memory (std has no mmap, so this declares the libc call).
@@ -171,7 +172,15 @@ fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmap
     let mut last_doc = vec![0u32; vocab.words.len()]; // doc + 1 of the last pair per term
     let mut last_match = vec![0u32; ph.terms.len()]; // doc + 1 of the last match per phrase
     let mut ids: Vec<u32> = Vec::new(); // the current document's term ids (u32::MAX for a token no query uses)
+    let mut released = at;
     while at < end {
+        // Behind us the pages are finished with: hand whole pages back (MADV_DONTNEED drops only this process's
+        // mapping; the file stays in the page cache), so the corpus never sits fully resident.
+        if at - released >= 1 << 22 {
+            let (lo, hi) = ((released + 4095) & !4095, at & !4095);
+            unsafe { madvise(d.as_ptr().add(lo) as *mut u8, hi - lo, 4) };
+            released = at;
+        }
         let mut doc = 0u32;
         while d[at] != b'\t' {
             doc = doc * 10 + u32::from(d[at] - b'0');

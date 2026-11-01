@@ -19,7 +19,6 @@ Every step from the reference to the final version, each with the live-board run
 | 10 | Check a phrase only in documents that hold all its terms | run-f4f6d4549d46 | 0.313 | 307 | 58.43 |
 | 11 | Match phrases while scanning, anchored on their rarest term; no per-token array, and terms used by no BOOL query keep no postings | run-24a01816d67c | 0.326 | 233 | 59.32 |
 | 12 | Each scan thread groups its own postings by term (no separate posting phase, no global posting array) | run-83109bd12e4b | 0.329 | 208 | 59.78 |
-| 13 | Remove the `madvise` page release (step 5): the board's M does not count mapped file pages | run-TBD | | | |
 
 ## Why each change helped
 
@@ -52,6 +51,8 @@ Every step from the reference to the final version, each with the live-board run
 Overall (interleaved A/B on the full dataset): median 0.61 s to 0.40 s (-34%), peak RSS 707,900 KB to 284,868 KB (-60%).
 
 ## Tried and reverted (the log lives in `tuning/LOG_TRACK_B.md` outside the repo)
+
+- **Remove the `madvise` page release.** The board's M does not count mapped file pages (see Track A), so the call looked dead. Without it the board run was slower (run-4786155891e8: 0.353 s, 59.20 points against about 0.33 s and 59.7 to 60.0 with it, same code otherwise); the likely reason is that the unmap at exit has to drop 254 MB of still-mapped pages. Put back.
 
 - **Prefetch a document's table slots before the lookups.** Collect a document's token keys, prefetch their slots, then look them up. 7% faster on the laptop, no change on the board (run-aa7e06dd6e42: 0.336 s against 0.334 s, 57.58 points against 57.74); the scoring box's larger L2 cache already holds the table.
 
