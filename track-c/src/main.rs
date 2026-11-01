@@ -215,26 +215,32 @@ fn main() {
         std::process::exit(1)
     };
 
-    // regions.csv: a header line, then "region_id,CCC" lines.
-    let mut region_rows: Vec<(usize, &[u8])> = Vec::new();
+    // regions.csv: a header line, then "region_id,CCC" lines. A country code is three letters A-Z, so its base-26 number
+    // indexes a table of 26^3 entries directly, and walking that table in order gives the codes already sorted.
+    let mut region_rows: Vec<(usize, usize)> = Vec::new(); // (region id, code number)
+    let mut present = vec![false; 26 * 26 * 26];
     let mut at = regions.iter().position(|&c| c == b'\n').expect("regions header") + 1;
     while at < regions.len() {
         let comma = at + regions[at..].iter().position(|&c| c == b',').expect("comma");
         let id = regions[at..comma].iter().fold(0usize, |a, &c| a * 10 + usize::from(c - b'0'));
-        let eol = comma + 1 + regions[comma + 1..].iter().position(|&c| c == b'\n').unwrap_or(regions.len() - comma - 1);
-        region_rows.push((id, &regions[comma + 1..eol]));
-        at = eol + 1;
+        let code = regions[comma + 1..comma + 4].iter().fold(0usize, |a, &c| a * 26 + usize::from(c - b'A'));
+        present[code] = true;
+        region_rows.push((id, code));
+        at = comma + 5; // "CCC\n"
     }
     // Country keys in byte order. "_UNMATCHED" sorts after every three-letter code.
-    let mut keys: Vec<&[u8]> = region_rows.iter().map(|r| r.1).collect();
-    keys.push(b"_UNMATCHED");
-    keys.sort_unstable();
-    keys.dedup();
-    let unmatched = keys.binary_search(&&b"_UNMATCHED"[..]).unwrap() as u16;
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    let mut index_of_code = vec![0u16; present.len()];
+    for (code, _) in present.iter().enumerate().filter(|&(_, &p)| p) {
+        index_of_code[code] = keys.len() as u16;
+        keys.push(vec![b'A' + (code / 676) as u8, b'A' + (code / 26 % 26) as u8, b'A' + (code % 26) as u8]);
+    }
+    keys.push(b"_UNMATCHED".to_vec());
+    let unmatched = (keys.len() - 1) as u16;
     let table_len = region_rows.iter().map(|r| r.0).max().map_or(0, |m| m + 1);
     let mut country_of_region = vec![unmatched; table_len];
     for &(id, code) in &region_rows {
-        country_of_region[id] = keys.binary_search(&code).unwrap() as u16;
+        country_of_region[id] = index_of_code[code];
     }
     let country_bits = usize::BITS - (keys.len() - 1).leading_zeros();
 
