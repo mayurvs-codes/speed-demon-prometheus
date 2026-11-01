@@ -27,6 +27,12 @@ fn map(path: &str) -> Option<&'static [u8]> {
     (p as isize != -1).then(|| unsafe { std::slice::from_raw_parts(p, len) })
 }
 
+/// Pointer shared by threads that write to provably disjoint slots.
+#[derive(Clone, Copy)]
+struct Disjoint<T>(*mut T);
+unsafe impl<T> Send for Disjoint<T> {}
+unsafe impl<T> Sync for Disjoint<T> {}
+
 fn hash64(bytes: &[u8]) -> u64 {
     let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ (bytes.len() as u64).wrapping_mul(0xA24B_AED4_963E_E407);
     let mut words = bytes.chunks_exact(8);
@@ -200,31 +206,86 @@ fn main() {
     let width = endpoints.len();
     let buckets = HOURS * width;
 
-    // Counting sort of the latencies into buckets; error counts are tallied on the way.
+    // Counting sort of the latencies into buckets, in parallel. Every chunk counts its own records (and its server
+    // errors) per bucket; the counts become start positions, chunk after chunk inside each bucket; then every chunk
+    // scatters its own latencies into those private ranges.
+    let mut pos: Vec<Vec<[u32; 2]>> = thread::scope(|sc| {
+        let endpoints = &endpoints;
+        let jobs: Vec<_> = chunks
+            .iter_mut()
+            .map(|c| {
+                sc.spawn(move || {
+                    let rank: Vec<u32> = c.dict.names.iter().map(|n| endpoints.binary_search(n).unwrap() as u32).collect();
+                    let mut count = vec![[0u32; 2]; buckets];
+                    for r in c.recs.iter_mut() {
+                        let b = r.hour as usize * width + rank[r.endpoint as usize] as usize;
+                        r.endpoint = b as u32;
+                        count[b][0] += 1;
+                        count[b][1] += u32::from(r.server_error);
+                    }
+                    count
+                })
+            })
+            .collect();
+        jobs.into_iter().map(|j| j.join().unwrap()).collect()
+    });
+    // Totals and start positions, in parallel over ranges of buckets: a thread touches only its own buckets, in every
+    // chunk's array. Prefix sums over the 132,000 bucket totals are cheap and stay sequential.
+    let nt = pos.len().max(1);
+    let per = buckets.div_ceil(nt).max(1);
+    let arrays: Vec<Disjoint<[u32; 2]>> = pos.iter_mut().map(|p| Disjoint(p.as_mut_ptr())).collect();
     let mut begin = vec![0u32; buckets + 1];
     let mut errors = vec![0u32; buckets];
-    for c in chunks.iter_mut() {
-        let rank: Vec<u32> = c.dict.names.iter().map(|n| endpoints.binary_search(n).unwrap() as u32).collect();
-        for r in c.recs.iter_mut() {
-            let b = r.hour as usize * width + rank[r.endpoint as usize] as usize;
-            r.endpoint = b as u32;
-            begin[b + 1] += 1;
-            errors[b] += u32::from(r.server_error);
+    thread::scope(|sc| {
+        for (i, (total, errs)) in begin[1..].chunks_mut(per).zip(errors.chunks_mut(per)).enumerate() {
+            let arrays = &arrays;
+            sc.spawn(move || {
+                for (k, (t, e)) in total.iter_mut().zip(errs.iter_mut()).enumerate() {
+                    for a in arrays.iter() {
+                        // SAFETY: read only; bucket i * per + k exists in every chunk's array.
+                        let c = unsafe { *a.0.add(i * per + k) };
+                        *t += c[0];
+                        *e += c[1];
+                    }
+                }
+            });
         }
-    }
+    });
     for b in 0..buckets {
         begin[b + 1] += begin[b];
     }
-    let mut latencies = vec![0u32; begin[buckets] as usize];
-    let mut fill = begin[..buckets].to_vec();
-    for c in &chunks {
-        for r in &c.recs {
-            let slot = &mut fill[r.endpoint as usize];
-            latencies[*slot as usize] = r.latency;
-            *slot += 1;
+    thread::scope(|sc| {
+        for i in 0..nt {
+            let (arrays, begin) = (&arrays, &begin);
+            sc.spawn(move || {
+                for b in (i * per).min(buckets)..((i + 1) * per).min(buckets) {
+                    let mut at = begin[b];
+                    for a in arrays.iter() {
+                        // SAFETY: this thread is the only one that touches bucket b in any chunk's array.
+                        let c = unsafe { &mut *a.0.add(b) };
+                        let n = c[0];
+                        c[0] = at; // first slot of this chunk inside bucket b
+                        at += n;
+                    }
+                }
+            });
         }
-    }
-    drop(fill);
+    });
+    let mut latencies = vec![0u32; begin[buckets] as usize];
+    let dst = Disjoint(latencies.as_mut_ptr());
+    thread::scope(|sc| {
+        for (c, mut p) in chunks.iter().zip(pos) {
+            sc.spawn(move || {
+                let dst = dst;
+                for r in &c.recs {
+                    let slot = &mut p[r.endpoint as usize][0];
+                    // SAFETY: every (chunk, bucket) pair owns its own range of `latencies`, sized by its count.
+                    unsafe { *dst.0.add(*slot as usize) = r.latency };
+                    *slot += 1;
+                }
+            });
+        }
+    });
 
     // Each thread takes a run of hours: its latency range and output slots are disjoint.
     let labels = hour_labels();
