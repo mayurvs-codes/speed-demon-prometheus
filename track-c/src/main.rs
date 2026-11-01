@@ -134,7 +134,9 @@ fn field(d: &[u8], at: usize, scratch: &mut Vec<u8>, want_hash: bool) -> Option<
 }
 
 fn parse_chunk(d: &[u8], mut at: usize, end: usize, j: &Join) -> Part {
-    let mut part = Part { totals: vec![Totals::NONE; j.countries], keys: vec![Vec::new(); j.shards], end: 0, ok: true };
+    // Records average ~60 bytes; reserve each shard's expected share up front (untouched pages cost no memory).
+    let per_shard = (end - at) / 50 / j.shards;
+    let mut part = Part { totals: vec![Totals::NONE; j.countries], keys: (0..j.shards).map(|_| Vec::with_capacity(per_shard)).collect(), end: 0, ok: true };
     let mut scratch = Vec::new();
     let country_mask = (1u64 << j.country_bits) - 1;
     let mut released = at;
