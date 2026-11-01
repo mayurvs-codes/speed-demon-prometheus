@@ -3,6 +3,7 @@
 // records (endpoint, hour, latency, error flag). Records are then counting-sorted into one bucket
 // per (hour, endpoint); percentiles come from select_nth_unstable inside each bucket, and each
 // thread formats a range of hours so the output is simply the hours in order.
+use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -105,6 +106,20 @@ struct Chunk {
     dict: Dict,
 }
 
+/// Index of the first `needle` byte at or after `from`, looking at 32 bytes at a time.
+fn find(d: &[u8], from: usize, needle: u8) -> Option<usize> {
+    let mut i = from;
+    while i + 32 <= d.len() {
+        let hits = unsafe { _mm256_cmpeq_epi8(_mm256_loadu_si256(d.as_ptr().add(i) as *const __m256i), _mm256_set1_epi8(needle as i8)) };
+        let m = unsafe { _mm256_movemask_epi8(hits) } as u32;
+        if m != 0 {
+            return Some(i + m.trailing_zeros() as usize);
+        }
+        i += 32;
+    }
+    d[i..].iter().position(|&c| c == needle).map(|p| i + p)
+}
+
 fn digit(b: u8) -> usize {
     usize::from(b - b'0')
 }
@@ -132,9 +147,7 @@ fn read_chunk(d: &'static [u8], mut at: usize, end: usize) -> Chunk {
         }
         at += 1;
         let name_start = at;
-        while d[at] != b' ' {
-            at += 1;
-        }
+        at = find(d, at, b' ').expect("space after the endpoint");
         let name = &d[name_start..at];
         at += 1;
         let server_error = u8::from(d[at] == b'5');
