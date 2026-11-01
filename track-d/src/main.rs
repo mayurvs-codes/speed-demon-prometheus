@@ -13,6 +13,27 @@ use std::thread;
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn getrusage(who: i32, usage: *mut RUsage) -> i32;
+}
+
+#[repr(C)]
+struct RUsage {
+    ru_utime: [u64; 2],
+    ru_stime: [u64; 2],
+    ru_maxrss: i64,
+    ru_ixrss: i64,
+    ru_idrss: i64,
+    ru_isrss: i64,
+    ru_minflt: i64,
+    ru_majflt: i64,
+    ru_nswap: i64,
+    ru_inblock: i64,
+    ru_oublock: i64,
+    ru_msgsnd: i64,
+    ru_msgrcv: i64,
+    ru_nsignals: i64,
+    ru_nvcsw: i64,
+    ru_nivcsw: i64,
 }
 
 /// Maps a file read-only into memory (std has no mmap, so this declares the libc call).
@@ -51,16 +72,10 @@ struct Arc {
     w: u32,
 }
 
-/// Dijkstra state for one node: best known distance and the query that wrote it.
-// Packed to 12 bytes (instead of 16) so a search moves less memory; the fields are only ever read and written by value.
-#[derive(Clone, Copy, Default)]
-#[repr(C, packed)]
-struct Label {
-    dist: u64,
-    seen: u32,
-}
+
 
 fn main() {
+    let t0 = std::time::Instant::now();
     let Some(g) = map("/data/graph.txt") else { std::process::exit(1) };
     let mut at = 0usize;
     let n = num(g, &mut at) as usize;
@@ -210,6 +225,8 @@ fn main() {
         }
     }
 
+
+
     // Answer queries; each thread owns its label array and heap.
     let next = AtomicUsize::new(0);
     let (queries_ref, first, arcs, in_deg, next, new_id) = (&queries, &first, &arcs, &in_deg, &next, &new_id);
@@ -217,8 +234,8 @@ fn main() {
         let jobs: Vec<_> = (0..threads)
             .map(|_| {
                 sc.spawn(move || {
-                    let mut label = vec![Label::default(); n];
-                    let mut epoch = 0u32;
+                    let mut dist = vec![u64::MAX; n];
+                    let mut touched: Vec<u32> = Vec::with_capacity(16384);
                     let mut heap: BinaryHeap<Reverse<u128>> = BinaryHeap::new(); // key = distance << 32 | node
                     let mut done = Vec::new();
                     loop {
@@ -234,14 +251,14 @@ fn main() {
                             continue;
                         }
                         let (s, t) = (new_id[s as usize], new_id[t as usize]);
-                        epoch += 1;
                         heap.clear();
-                        label[s as usize] = Label { dist: 0, seen: epoch };
+                        dist[s as usize] = 0;
+                        touched.push(s);
                         heap.push(Reverse(u128::from(s)));
                         let mut answer = -1i64;
                         while let Some(Reverse(key)) = heap.pop() {
                             let (d, v) = ((key >> 32) as u64, key as u32);
-                            if d > label[v as usize].dist {
+                            if d > dist[v as usize] {
                                 continue; // stale entry
                             }
                             if v == t {
@@ -251,13 +268,20 @@ fn main() {
                             let (lo, hi) = (first[v as usize] as usize, first[v as usize + 1] as usize);
                             for a in &arcs[lo..hi] {
                                 let nd = d + u64::from(a.w);
-                                let l = &mut label[a.head as usize];
-                                if l.seen != epoch || nd < l.dist {
-                                    *l = Label { dist: nd, seen: epoch };
+                                let h = a.head as usize;
+                                if nd < dist[h] {
+                                    if dist[h] == u64::MAX {
+                                        touched.push(a.head);
+                                    }
+                                    dist[h] = nd;
                                     heap.push(Reverse(u128::from(nd) << 32 | u128::from(a.head)));
                                 }
                             }
                         }
+                        for &v in &touched {
+                            dist[v as usize] = u64::MAX;
+                        }
+                        touched.clear();
                         done.push((qi, answer));
                     }
                     done
@@ -277,4 +301,9 @@ fn main() {
         text.push('\n');
     }
     File::create("/out/distances.txt").expect("create /out/distances.txt").write_all(text.as_bytes()).expect("write output");
+    let elapsed = t0.elapsed();
+    let mut ru = std::mem::MaybeUninit::<RUsage>::zeroed();
+    unsafe { getrusage(0, ru.as_mut_ptr()) };
+    let rss = unsafe { ru.assume_init().ru_maxrss };
+    eprintln!("SD_METRICS time={:.4} rss={}", elapsed.as_secs_f64(), rss);
 }

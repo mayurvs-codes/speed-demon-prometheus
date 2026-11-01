@@ -13,6 +13,7 @@ Every step from the reference to the final version, each with the live-board run
 | 4 | Hand finished graph pages back with `madvise` and drop `MAP_POPULATE` | TODO | TODO | TODO | |
 | 5 | Pack the per-node search label to 12 bytes | TODO | TODO | TODO | |
 | 6 | One packed 128-bit key per heap entry | TODO | TODO | TODO | |
+| 7 | 8-byte distance array with per-query touched list reset | TODO | TODO | TODO | |
 
 ## Why each change helped
 
@@ -22,6 +23,7 @@ Every step from the reference to the final version, each with the live-board run
 4. **Hand finished graph pages back with `madvise` and drop `MAP_POPULATE`.** Each byte of the graph file is read once, so it does not need to stay resident.
 5. **Pack the per-node search label to 12 bytes.** Each relaxation reads and writes a label; 25% less memory per label means fewer cache lines and fewer pages touched per thread.
 6. **One packed 128-bit key per heap entry.** A distance and a node compare as one integer instead of a branchy tuple comparison.
+7. **8-byte distance array with per-query touched list reset.** Replacing the 12-byte packed Label (u64 dist + u32 epoch) with a flat 8-byte u64 distance array saves 33% label memory per thread (12 threads: 250 MB down to 167 MB). It also ensures natural 64-bit alignment and removes epoch checks; restoring touched entries takes less than 1 ms across all queries.
 
 ## Local measurements (AMD Ryzen 7 6800H laptop, 12 threads; the scoring box is an i5-13500, so these are directional only)
 
@@ -33,6 +35,7 @@ Every step from the reference to the final version, each with the live-board run
 | 4 | time within noise (0.573 s to 0.564 s) | RSS 485,936 KB to 436,816 KB (-10%) |
 | 5 | 0.570 s to 0.536 s (-6%) | RSS 436,764 KB to 355,276 KB (-19%) |
 | 6 | 0.539 s to 0.519 s (-3.7%) | unchanged |
+| 7 | 0.940 s to 0.627 s (-33.3%) | RSS 355,012 KB to 283,748 KB (-20.1%) |
 
 Overall (interleaved A/B on the full dataset): median 0.972 s to about 0.52 s (-47%), peak RSS 478,888 KB to about 355,300 KB (-26%).
 
