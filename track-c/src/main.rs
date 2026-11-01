@@ -118,6 +118,20 @@ fn field(d: &[u8], at: usize, scratch: &mut Vec<u8>, want_hash: bool) -> Option<
         let h = if want_hash { hash64(&d[body..close]) } else { 0 };
         return Some((close + 1, (close - body) as u64, h));
     }
+    if !want_hash {
+        let mut escapes = 1;
+        let mut from = close + 2;
+        while let Some(next_close) = find(d, from, b'"') {
+            close = next_close;
+            if d.get(close + 1) == Some(&b'"') {
+                escapes += 1;
+                from = close + 2;
+            } else {
+                break;
+            }
+        }
+        return Some((close + 1, (close - body - escapes) as u64, 0));
+    }
     scratch.clear();
     let mut from = body;
     loop {
