@@ -79,7 +79,9 @@ The RSS figures above come from `/usr/bin/time`. The scorer reads the container'
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
-| 13 | A (term, document) pair is stored as the 4-byte term id, with a marker closing each document; the document id follows from position (ids are dense). Local peak RSS 191 -> 155 MB | TODO | TODO | TODO | |
-| 14 | Corpus pages are handed back every 1 MB instead of every 4 MB. Local peak RSS 156 -> 140 MB | TODO | TODO | TODO | |
+| 13 | A (term, document) pair is stored as the 4-byte term id, with a marker closing each document; the document id follows from position (ids are dense). Local peak RSS 191 -> 155 MB | see combined run below | | | |
+| 14 | Corpus pages are handed back every 1 MB instead of every 4 MB. Local peak RSS 156 -> 140 MB | `run-cf8b774d511b` (steps 13 and 14 together, commit `319d3c8`) | 0.328 | 160 | 60.69 |
 
 Local A/B of both steps together against commit 0934019 (Docker, volume copy of b_full, 11 interleaved runs, median): 0.403 -> 0.381 s, peak RSS 192,568 -> 138,820 KB. Docker on Windows is noisy (single runs 0.33 to 0.52 s), so only the memory change is clear; the time difference is inside the noise.
+
+Board result of steps 13 and 14 together (commit `319d3c8`): run `run-cf8b774d511b`, T = 0.328 s (was 0.356 s), M = 160 MB (was 195 MB), 60.69 points (was 59.00); every gate passed. The time change is small and may be noise; the memory drop is real.
