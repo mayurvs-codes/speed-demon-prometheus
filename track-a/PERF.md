@@ -4,6 +4,8 @@ Every step from the reference to the final version, each with the live-board run
 
 **Board result, all tuning steps combined (commit `bbb8ff3`): run `run-abca22fa67d2`.** T = 0.065 s, M = 76 MB, K = 20.6, 65.7 points; every gate passed. The Run ID, T and M columns in the step table below are still TODO: the steps were tuned locally and have not each been measured on the board yet, so they are left blank rather than guessed. The "Local measurements" section is from one laptop and is only for comparing changes against each other.
 
+**Latest board run (code of commit `8f492c2`): `run-bf3e42893655`.** T = 0.0562 s, M = 68.9 MB, S = 360, K = 22.94, 68.03 points; every gate passed. Board noise on identical Track A code is about 5% in T (0.0562 to 0.0615 s over four runs of this code).
+
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
