@@ -371,11 +371,11 @@ fn main() {
         }
     }
     vocab.index();
-    run(&vocab, &queries);
+    run(&mut vocab, &mut queries);
 }
 
 /// Everything after the query parse.
-fn run(vocab: &Vocab, queries: &[Query]) {
+fn run(vocab: &mut Vocab, queries: &mut [Query]) {
     let n_terms = vocab.words.len();
 
     // 2. Choose the frequent terms. A short sample of each thread's slice estimates document frequencies. A term
@@ -412,6 +412,23 @@ fn run(vocab: &Vocab, queries: &[Query]) {
     let sampled_docs: usize = sample.iter().map(|s| s.count).sum();
     let seen: Vec<usize> = (0..n_terms).map(|t| sample.iter().map(|s| s.per_term[t] as usize).sum()).collect();
     drop(sample);
+    // Number the terms by falling sampled frequency, so the per-term state of the words that make up most tokens
+    // sits together in cache. Only the ids change; the vocabulary table and the queries are renumbered to match.
+    let mut order: Vec<u32> = (0..n_terms as u32).collect();
+    order.sort_by_key(|&t| std::cmp::Reverse(seen[t as usize]));
+    let mut new_id = vec![0u32; n_terms];
+    for (n, &t) in order.iter().enumerate() {
+        new_id[t as usize] = n as u32;
+    }
+    vocab.words = order.iter().map(|&t| std::mem::take(&mut vocab.words[t as usize])).collect();
+    vocab.long.clear();
+    vocab.index();
+    for q in queries.iter_mut() {
+        let (Query::Bool { terms, .. } | Query::Phrase(terms)) = q;
+        terms.iter_mut().for_each(|t| *t = new_id[*t as usize]);
+    }
+    let seen: Vec<usize> = order.iter().map(|&t| seen[t as usize]).collect();
+    let (vocab, queries): (&Vocab, &[Query]) = (vocab, queries);
     let mut in_bool = vec![false; n_terms];
     for q in queries {
         if let Query::Bool { terms, .. } = q {
