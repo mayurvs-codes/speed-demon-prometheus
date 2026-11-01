@@ -126,25 +126,32 @@ fn main() {
 
     // The node ids in the file are a random relabelling, so every edge hop lands somewhere far away in memory.
     // Renumber the nodes in breadth-first order: neighbours then get nearby ids, and a search walks nearby memory.
-    let mut new_id = vec![u32::MAX; n];
+    // The visited set is a bitset (218 KB, stays in cache); the old-to-new map is filled afterwards in one pass.
+    let mut seen = vec![0u64; n.div_ceil(64)];
     let mut old_of: Vec<u32> = Vec::with_capacity(n); // old_of[new id] = old id; doubles as the BFS queue
     for root in 0..n {
-        if new_id[root] != u32::MAX {
+        if seen[root >> 6] >> (root & 63) & 1 != 0 {
             continue;
         }
-        new_id[root] = old_of.len() as u32;
+        seen[root >> 6] |= 1 << (root & 63);
         old_of.push(root as u32);
         let mut head = old_of.len() - 1;
         while head < old_of.len() {
             let v = old_of[head] as usize;
             head += 1;
             for a in &arcs[first[v] as usize..first[v + 1] as usize] {
-                if new_id[a.head as usize] == u32::MAX {
-                    new_id[a.head as usize] = old_of.len() as u32;
+                let h = a.head as usize;
+                if seen[h >> 6] >> (h & 63) & 1 == 0 {
+                    seen[h >> 6] |= 1 << (h & 63);
                     old_of.push(a.head);
                 }
             }
         }
+    }
+    drop(seen);
+    let mut new_id = vec![0u32; n];
+    for (i, &v) in old_of.iter().enumerate() {
+        new_id[v as usize] = i as u32;
     }
     let mut first2 = vec![0u32; n + 1];
     for i in 0..n {
