@@ -56,3 +56,7 @@ Overall (interleaved A/B on the full dataset): median 0.61 s to 0.40 s (-34%), p
 - **`-C target-cpu=native`.** Tune code generation to the CPU. No gain; also moves the build onto the scoring box.
 - **Profile-guided optimisation.** Build with the allowlisted `halloumee/speed-demon-rust` image. No gain (0.47 s to 0.47 s over 41 runs).
 - **Thread count.** Fewer than 12 threads. 12 is fastest.
+
+## Memory as the scorer counts it (cgroup `memory.peak`)
+
+The RSS figures above come from `/usr/bin/time`. The scorer reads the container's kernel peak counter instead, so it was re-measured in the board's sandbox shape (Docker Desktop VM, full-scale seed 1, three runs per build): **544.1 MB** with the `madvise` step and **544.6 MB** with the call turned into a no-op. The two agree within run-to-run noise, so handing pages back lowers RSS (about 708 MB to 285 MB) but **does not lower `memory.peak`**: the file pages stay in the page cache, which the cgroup still charges. Treat the memory gain of the `madvise` step as unproven; the board's M column is the authority. This is a local re-measurement, not a board number.

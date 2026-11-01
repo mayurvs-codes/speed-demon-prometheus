@@ -36,3 +36,7 @@ Overall (interleaved A/B on the full dataset): median 0.120 s to 0.077 s (-36%),
 - **Inline name comparison.** Compare endpoint names with an inline word-by-word loop instead of `memcmp`. No gain (0.080 s to 0.081 s).
 - **Thread count.** Fewer than 12 threads. 12 threads is as fast as 8 or 10 and faster than fewer; no change.
 - **Reserved output buffers.** Reserve each hour's output buffer up front. No gain (0.077 s to 0.078 s).
+
+## Memory as the scorer counts it (cgroup `memory.peak`)
+
+The RSS figures above come from `/usr/bin/time`. The scorer reads the container's kernel peak counter instead, so it was re-measured in the board's sandbox shape (Docker Desktop VM, full-scale seed 1, three runs per build): **307.8 MB** with the `madvise` step and **307.7 MB** with the call turned into a no-op. The two agree within run-to-run noise, so handing pages back lowers RSS (about 297 MB to 151 MB) but **does not lower `memory.peak`**: the file pages stay in the page cache, which the cgroup still charges. Treat the memory gain of the `madvise` step as unproven; the board's M column is the authority. This is a local re-measurement, not a board number.

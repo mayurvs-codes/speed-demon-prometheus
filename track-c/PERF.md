@@ -37,3 +37,7 @@ Overall (interleaved A/B on the full dataset): median 0.10 s to 0.059 s (-41%; m
 
 - **Thread count.** Fewer than 12 threads. 12 threads is fastest (57-61 ms against 62-64 for 10).
 - **Coarser page release.** Release pages every 16 MB instead of 4 MB. No faster and RSS rose from 67 MB to 185 MB.
+
+## Memory as the scorer counts it (cgroup `memory.peak`)
+
+The RSS figures above come from `/usr/bin/time`. The scorer reads the container's kernel peak counter instead, so it was re-measured in the board's sandbox shape (Docker Desktop VM, full-scale seed 1, three runs per build): **263.8 MB** with the `madvise` step and **266.8 MB** with the call turned into a no-op. The two agree within run-to-run noise, so handing pages back lowers RSS (about 268 MB to 67 MB) but **does not lower `memory.peak`**: the file pages stay in the page cache, which the cgroup still charges. Treat the memory gain of the `madvise` step as unproven; the board's M column is the authority. This is a local re-measurement, not a board number.

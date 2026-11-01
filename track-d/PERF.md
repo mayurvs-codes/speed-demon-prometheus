@@ -42,3 +42,7 @@ Overall (interleaved A/B on the full dataset): median 0.972 s to about 0.52 s (-
 - **Thread count.** Fewer than 12 threads. 12 threads is fastest (557-578 ms against 593-636 for 10).
 - **Prefetch the next heap top.** Prefetch the next heap top's data in the search. -1.7%, under the 3% bar.
 - **Prefetch in the edge scatter.** Prefetch in the edge scatter that builds the arc array. -1%, under the 3% bar.
+
+## Memory as the scorer counts it (cgroup `memory.peak`)
+
+The RSS figures above come from `/usr/bin/time`. The scorer reads the container's kernel peak counter instead, so it was re-measured in the board's sandbox shape (Docker Desktop VM, full-scale seed 1, three runs per build): **416.5 MB** with the `madvise` step and **417.0 MB** with the call turned into a no-op. The two agree within run-to-run noise, so handing pages back lowers RSS (about 479 MB to 355 MB) but **does not lower `memory.peak`**: the file pages stay in the page cache, which the cgroup still charges. Treat the memory gain of the `madvise` step as unproven; the board's M column is the authority. This is a local re-measurement, not a board number.
