@@ -182,7 +182,7 @@ fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmap
     while at < end {
         // Behind us the pages are finished with: hand whole pages back (MADV_DONTNEED drops only this process's
         // mapping; the file stays in the page cache), so the corpus never sits fully resident.
-        if at - released >= 1 << 22 {
+        if at - released >= 1 << 20 {
             let (lo, hi) = ((released + 4095) & !4095, at & !4095);
             unsafe { madvise(d.as_ptr().add(lo) as *mut u8, hi - lo, 4) };
             released = at;
