@@ -10,6 +10,7 @@ use std::thread;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
 /// Maps a file read-only into memory (std has no mmap, so this declares the libc call).
@@ -121,7 +122,15 @@ fn parse_chunk(d: &[u8], mut at: usize, end: usize, j: &Join) -> Part {
     let mut part = Part { totals: vec![Totals::NONE; j.countries], keys: vec![Vec::new(); j.shards], end: 0, ok: true };
     let mut scratch = Vec::new();
     let country_mask = (1u64 << j.country_bits) - 1;
+    let mut released = at;
     while at < end {
+        // Behind us the pages are finished with: hand whole pages back (MADV_DONTNEED drops only this process's
+        // mapping; the file stays in the page cache), so the input never sits fully resident.
+        if at - released >= 1 << 22 {
+            let (lo, hi) = ((released + 4095) & !4095, at & !4095);
+            unsafe { madvise(d.as_ptr().add(lo) as *mut u8, hi - lo, 4) };
+            released = at;
+        }
         if has_bom(d, at) {
             at += 3;
         }
