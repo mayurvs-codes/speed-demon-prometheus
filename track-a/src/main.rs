@@ -12,6 +12,7 @@ const HOURS: usize = 72;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
 /// Maps a file read-only into memory (std has no mmap, so this declares the libc call).
@@ -104,7 +105,15 @@ fn digit(b: u8) -> usize {
 
 fn read_chunk(d: &'static [u8], mut at: usize, end: usize) -> Chunk {
     let mut c = Chunk { recs: Vec::with_capacity((end - at) / 70 + 16), dict: Dict::new() };
+    let mut released = at;
     while at < end {
+        // Behind us the pages are finished with: hand whole pages back (MADV_DONTNEED drops only this process's
+        // mapping; the file stays in the page cache), so the input never sits fully resident.
+        if at - released >= 1 << 22 {
+            let (lo, hi) = ((released + 4095) & !4095, at & !4095);
+            unsafe { madvise(d.as_ptr().add(lo) as *mut u8, hi - lo, 4) };
+            released = at;
+        }
         // "YYYY-MM-DDTHH:MM:SS.ffffffZ " is 28 bytes; the hour index is counted from 2026-10-30T18.
         let month = digit(d[at + 5]) * 10 + digit(d[at + 6]);
         let day = digit(d[at + 8]) * 10 + digit(d[at + 9]);
