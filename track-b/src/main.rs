@@ -120,8 +120,10 @@ struct Slice {
 struct TermState {
     last_doc: u32, // doc + 1 of the last pair
     row: i32,      // bitmap row, -1 for none, -2 for a term no BOOL query uses
-    pairs: u32,    // pairs recorded
+    pairs: u32,    // pairs recorded, plus ANCHOR when some phrase is anchored on this term
 }
+
+const ANCHOR: u32 = 1 << 31;
 
 /// Groups a slice's pairs by term with a counting sort. The pairs are in document order, so each group stays ascending.
 fn group(s: &mut Slice) {
@@ -183,9 +185,10 @@ unsafe fn token_key(d: &[u8], at: usize, len: usize) -> (u64, u64) {
 fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmaps: &[AtomicU64], words: usize, ph: &Phrases) -> Slice {
     let mut s = Slice { phrases: (0..ph.terms.len()).map(|_| Answer::default()).collect(), ..Default::default() };
     // Everything the scan keeps per term sits together, so a token costs one cache miss here.
-    let mut state: Vec<TermState> = rows.iter().map(|&row| TermState { last_doc: 0, row, pairs: 0 }).collect();
+    let mut state: Vec<TermState> = rows.iter().enumerate().map(|(t, &row)| TermState { last_doc: 0, row, pairs: if ph.anchored[t >> 6] >> (t & 63) & 1 == 1 { ANCHOR } else { 0 } }).collect();
     let mut last_match = vec![0u32; ph.terms.len()]; // doc + 1 of the last match per phrase
     let mut ids: Vec<u32> = Vec::new(); // the current document's term ids (u32::MAX for a token no query uses)
+    let mut anchors: Vec<usize> = Vec::new(); // positions in `ids` of terms that some phrase is anchored on
     let mut released = at;
     while at < end {
         // Behind us the pages are finished with: hand whole pages back (MADV_DONTNEED drops only this process's
@@ -206,6 +209,7 @@ fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmap
         }
         s.count += 1;
         ids.clear();
+        anchors.clear();
         // The text runs to the newline, read 32 bytes at a time. In each block, `m` marks token bytes, and
         // `m ^ (m << 1 | carry)` marks every token start and end (carry = the token continues from the last block).
         let (mut open, mut carry) = (0usize, 0u32);
@@ -257,6 +261,9 @@ fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmap
                 continue;
             }
             let e = &mut state[t as usize];
+            if e.pairs & ANCHOR != 0 {
+                anchors.push(i);
+            }
             if e.row != -2 && e.last_doc != doc + 1 {
                 e.last_doc = doc + 1;
                 if e.row < 0 {
@@ -268,8 +275,8 @@ fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmap
             }
         }
         s.pairs.push(u32::MAX);
-        for (i, &t) in ids.iter().enumerate().filter(|&(_, &t)| t != u32::MAX && ph.anchored[t as usize >> 6] >> (t & 63) & 1 == 1) {
-            for &(p, off) in &ph.at[t as usize] {
+        for &i in &anchors {
+            for &(p, off) in &ph.at[ids[i] as usize] {
                 let terms = ph.terms[p as usize];
                 if i >= off && ids.get(i - off..i - off + terms.len()) == Some(terms) && last_match[p as usize] != doc + 1 {
                     last_match[p as usize] = doc + 1;
@@ -278,7 +285,7 @@ fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmap
             }
         }
     }
-    s.per_term = state.iter().map(|e| e.pairs).collect();
+    s.per_term = state.iter().map(|e| e.pairs & !ANCHOR).collect();
     s
 }
 
