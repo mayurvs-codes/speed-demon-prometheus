@@ -85,3 +85,12 @@ The RSS figures above come from `/usr/bin/time`. The scorer reads the container'
 Local A/B of both steps together against commit 0934019 (Docker, volume copy of b_full, 11 interleaved runs, median): 0.403 -> 0.381 s, peak RSS 192,568 -> 138,820 KB. Docker on Windows is noisy (single runs 0.33 to 0.52 s), so only the memory change is clear; the time difference is inside the noise.
 
 Board result of steps 13 and 14 together (commit `319d3c8`): run `run-cf8b774d511b`, T = 0.328 s (was 0.356 s), M = 160 MB (was 195 MB), 60.69 points (was 59.00); every gate passed. The time change is small and may be noise; the memory drop is real.
+
+## Time steps after run-cf8b774d511b (local only, board runs pending)
+
+| Step | Change | Run ID | T (s) | M (MB) | Points |
+|---|---|---|---|---|---|
+| 15 | After the sampling pass, terms are numbered by falling sampled frequency (vocabulary table and queries are renumbered). The few thousand common words that make up most tokens now keep their per-term state next to each other, so it stays in cache. Local: wall -7%, CPU -11% | TODO | TODO | TODO | |
+| 16 | The scan only tokenizes and looks terms up while it reads a document; recording the document's terms (last-seen stamp, bitmap bit or pair) is a second loop over the document's term ids, with each term's state (now one 12-byte struct) prefetched 8 tokens ahead. Local: wall -13%, CPU -13% | TODO | TODO | TODO | |
+
+Local A/B of steps 15 and 16 against commit `d99dcc3` (Docker, volume copy of b_full, 15 interleaved runs, median): wall 0.373 -> 0.327 s (-12%), CPU (user+sys) 2.758 -> 2.227 s (-19%), peak RSS 139,116 -> 140,988 KB (+1.4%). Docker on Windows is noisy (single runs 0.27 to 0.47 s), so these are directional; the board decides. Tried and dropped: prefetch in the posting grouping (+5% slower), plain stores instead of atomic bitmap updates (-1.3%), a smaller sampling pass (-1.5%).
