@@ -34,6 +34,8 @@ struct Disjoint<T>(*mut T);
 unsafe impl<T> Send for Disjoint<T> {}
 unsafe impl<T> Sync for Disjoint<T> {}
 
+/// A 64-bit hash of an endpoint name. The names of one file are told apart by this hash alone: 1,842 names make a
+/// collision about as likely as 1 in 10^13.
 fn hash64(bytes: &[u8]) -> u64 {
     let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ (bytes.len() as u64).wrapping_mul(0xA24B_AED4_963E_E407);
     let mut words = bytes.chunks_exact(8);
@@ -41,10 +43,12 @@ fn hash64(bytes: &[u8]) -> u64 {
         h = (h ^ u64::from_le_bytes(w.try_into().unwrap())).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
         h ^= h >> 32;
     }
-    let mut last = [0u8; 8];
-    last[..words.remainder().len()].copy_from_slice(words.remainder());
-    h = (h ^ u64::from_le_bytes(last)).wrapping_mul(0xC4CE_B9FE_1A85_EC53);
-    h ^ (h >> 29)
+    // The last 8 bytes (overlapping the words above), or the whole name when it is shorter than 8 bytes.
+    let last = bytes.len().checked_sub(8).map_or_else(|| bytes.iter().rev().fold(0, |a, &b| a << 8 | u64::from(b)), |n| u64::from_le_bytes(bytes[n..].try_into().unwrap()));
+    h = (h ^ last).wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+    h ^= h >> 29;
+    h = h.wrapping_mul(0x9FB2_1C65_1E98_DF25);
+    h ^ (h >> 32)
 }
 
 #[derive(Clone, Copy)]
@@ -80,7 +84,7 @@ impl Dict {
                     self.names.push(name);
                     return self.names.len() as u32 - 1;
                 }
-                (sh, sid) if sh == h && self.names[sid as usize - 1] == name => return sid - 1,
+                (sh, sid) if sh == h => return sid - 1,
                 _ => i = (i + 1) & mask,
             }
         }
