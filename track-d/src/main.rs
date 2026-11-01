@@ -52,7 +52,9 @@ struct Arc {
 }
 
 /// Dijkstra state for one node: best known distance and the query that wrote it.
+// Packed to 12 bytes (instead of 16) so a search moves less memory; the fields are only ever read and written by value.
 #[derive(Clone, Copy, Default)]
+#[repr(C, packed)]
 struct Label {
     dist: u64,
     seen: u32,
