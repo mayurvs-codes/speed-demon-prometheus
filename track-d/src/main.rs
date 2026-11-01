@@ -124,6 +124,56 @@ fn main() {
         });
     }
 
+    // The node ids in the file are a random relabelling, so every edge hop lands somewhere far away in memory.
+    // Renumber the nodes in breadth-first order: neighbours then get nearby ids, and a search walks nearby memory.
+    let mut new_id = vec![u32::MAX; n];
+    let mut old_of: Vec<u32> = Vec::with_capacity(n); // old_of[new id] = old id; doubles as the BFS queue
+    for root in 0..n {
+        if new_id[root] != u32::MAX {
+            continue;
+        }
+        new_id[root] = old_of.len() as u32;
+        old_of.push(root as u32);
+        let mut head = old_of.len() - 1;
+        while head < old_of.len() {
+            let v = old_of[head] as usize;
+            head += 1;
+            for a in &arcs[first[v] as usize..first[v + 1] as usize] {
+                if new_id[a.head as usize] == u32::MAX {
+                    new_id[a.head as usize] = old_of.len() as u32;
+                    old_of.push(a.head);
+                }
+            }
+        }
+    }
+    let mut first2 = vec![0u32; n + 1];
+    for i in 0..n {
+        let v = old_of[i] as usize;
+        first2[i + 1] = first2[i] + (first[v + 1] - first[v]);
+    }
+    let mut arcs2 = vec![Arc::default(); arcs.len()];
+    thread::scope(|sc| {
+        let mut rest: &mut [Arc] = &mut arcs2;
+        for t in 0..threads {
+            let (lo, hi) = (n * t / threads, n * (t + 1) / threads);
+            let (mine, tail) = std::mem::take(&mut rest).split_at_mut((first2[hi] - first2[lo]) as usize);
+            rest = tail;
+            let (old_of, new_id, first, arcs) = (&old_of, &new_id, &first, &arcs);
+            sc.spawn(move || {
+                let mut at = 0;
+                for &v in &old_of[lo..hi] {
+                    for a in &arcs[first[v as usize] as usize..first[v as usize + 1] as usize] {
+                        mine[at] = Arc { head: new_id[a.head as usize], w: a.w };
+                        at += 1;
+                    }
+                }
+            });
+        }
+    });
+    first = first2; // the old arrays are freed by these assignments
+    arcs = arcs2;
+    drop(old_of);
+
     let mut queries: Vec<(u32, u32)> = Vec::new();
     if let Some(q) = map("/data/queries.txt") {
         let mut i = 0;
@@ -136,7 +186,7 @@ fn main() {
 
     // Answer queries; each thread owns its label array and heap.
     let next = AtomicUsize::new(0);
-    let (queries_ref, first, arcs, in_deg, next) = (&queries, &first, &arcs, &in_deg, &next);
+    let (queries_ref, first, arcs, in_deg, next, new_id) = (&queries, &first, &arcs, &in_deg, &next, &new_id);
     let answered: Vec<Vec<(usize, i64)>> = thread::scope(|sc| {
         let jobs: Vec<_> = (0..threads)
             .map(|_| {
@@ -157,6 +207,7 @@ fn main() {
                             done.push((qi, -1));
                             continue;
                         }
+                        let (s, t) = (new_id[s as usize], new_id[t as usize]);
                         epoch += 1;
                         heap.clear();
                         label[s as usize] = Label { dist: 0, seen: epoch };
