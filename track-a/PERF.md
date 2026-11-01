@@ -16,6 +16,7 @@ Every step from the reference to the final version, each with the live-board run
 | 5 | Tell endpoint names apart by their 64-bit hash alone (no `memcmp`, no `memcpy` in the hash) | run-b237de1bd35f | 0.0593 | 77.7 | 66.84 |
 | 6 | 8-byte records: the endpoint id, hour and 5xx flag share one `u32` | run-b10da1d9fb74 | 0.0579 | 66.3 | 67.82 |
 | 7 | Remove the `madvise` page release (step 2): the board's M does not count mapped file pages | run-4ee67ae87f66 | 0.0573 | 65.8 | 68.03 |
+| 8 | Compact u32 bucket counters, AtomicU32 error counters, early drop of chunks/pos before formatting, fast hour parsing | TODO | TODO | TODO | |
 
 ## Why each change helped
 
@@ -26,6 +27,7 @@ Every step from the reference to the final version, each with the live-board run
 5. **Tell endpoint names apart by their 64-bit hash alone.** Every lookup compared the whole name again with `memcmp` (a library call and a read of the stored name, 26% of the cycles in a profile); with 1,842 names a 64-bit hash collision is about as likely as 1 in 10^13, and the hash no longer copies the name's tail. Board 0.0614 s to 0.0593 s; CPU time -14% on the laptop.
 6. **8-byte records.** A record held the endpoint id, hour, flag and latency in 12 bytes; the id (24 bits), hour (7 bits) and flag (1 bit) now share one `u32`, so the 3.1 million records take 25 MB instead of 37 MB. Board M 77.7 MB to 66.3 MB.
 7. **Remove `madvise`.** Steps 2's page release never changed the board's M (66.3 MB with it, 65.8 MB without), so it was dead code: removing it saved 7 lines and made no difference to the time.
+8. **Compact u32 bucket counters, AtomicU32 error counters, and early drops.** Halved per-thread bucket counters from `[u32; 2]` (12.7 MB) to `u32` (6.3 MB), replaced per-thread error tracking with a single 530 KB AtomicU32 array, and dropped chunks and pos arrays before formatting so the 10 MB output buffer does not stack on top of chunk memory. Local cgroup peak dropped from 63.3 MB to 46.5 MB (-26.5%) and wall time improved to 0.0685 s (-11.9%).
 
 ## Local measurements (AMD Ryzen 7 6800H laptop, 12 threads; the scoring box is an i5-13500, so these are directional only)
 

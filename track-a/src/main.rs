@@ -7,6 +7,7 @@ use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
 const HOURS: usize = 72;
@@ -35,6 +36,7 @@ unsafe impl<T> Sync for Disjoint<T> {}
 
 /// A 64-bit hash of an endpoint name. The names of one file are told apart by this hash alone: 1,842 names make a
 /// collision about as likely as 1 in 10^13.
+#[inline(always)]
 fn hash64(bytes: &[u8]) -> u64 {
     let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ (bytes.len() as u64).wrapping_mul(0xA24B_AED4_963E_E407);
     let mut words = bytes.chunks_exact(8);
@@ -43,7 +45,10 @@ fn hash64(bytes: &[u8]) -> u64 {
         h ^= h >> 32;
     }
     // The last 8 bytes (overlapping the words above), or the whole name when it is shorter than 8 bytes.
-    let last = bytes.len().checked_sub(8).map_or_else(|| bytes.iter().rev().fold(0, |a, &b| a << 8 | u64::from(b)), |n| u64::from_le_bytes(bytes[n..].try_into().unwrap()));
+    let last = bytes.len().checked_sub(8).map_or_else(
+        || bytes.iter().rev().fold(0, |a, &b| a << 8 | u64::from(b)),
+        |n| u64::from_le_bytes(bytes[n..].try_into().unwrap()),
+    );
     h = (h ^ last).wrapping_mul(0xC4CE_B9FE_1A85_EC53);
     h ^= h >> 29;
     h = h.wrapping_mul(0x9FB2_1C65_1E98_DF25);
@@ -67,6 +72,7 @@ impl Dict {
         Dict { slots: vec![(0, 0); 8192], names: Vec::new() }
     }
 
+    #[inline(always)]
     fn id(&mut self, name: &'static [u8]) -> u32 {
         if self.names.len() * 2 > self.slots.len() {
             self.grow();
@@ -108,10 +114,16 @@ struct Chunk {
 }
 
 /// Index of the first `needle` byte at or after `from`, looking at 32 bytes at a time.
+#[inline(always)]
 fn find(d: &[u8], from: usize, needle: u8) -> Option<usize> {
     let mut i = from;
     while i + 32 <= d.len() {
-        let hits = unsafe { _mm256_cmpeq_epi8(_mm256_loadu_si256(d.as_ptr().add(i) as *const __m256i), _mm256_set1_epi8(needle as i8)) };
+        let hits = unsafe {
+            _mm256_cmpeq_epi8(
+                _mm256_loadu_si256(d.as_ptr().add(i) as *const __m256i),
+                _mm256_set1_epi8(needle as i8),
+            )
+        };
         let m = unsafe { _mm256_movemask_epi8(hits) } as u32;
         if m != 0 {
             return Some(i + m.trailing_zeros() as usize);
@@ -121,6 +133,7 @@ fn find(d: &[u8], from: usize, needle: u8) -> Option<usize> {
     d[i..].iter().position(|&c| c == needle).map(|p| i + p)
 }
 
+#[inline(always)]
 fn digit(b: u8) -> usize {
     usize::from(b - b'0')
 }
@@ -129,12 +142,14 @@ fn read_chunk(d: &'static [u8], mut at: usize, end: usize) -> Chunk {
     let mut c = Chunk { recs: Vec::with_capacity((end - at) / 70 + 16), dict: Dict::new() };
     while at < end {
         // "YYYY-MM-DDTHH:MM:SS.ffffffZ " is 28 bytes; the hour index is counted from 2026-10-30T18.
-        let month = digit(d[at + 5]) * 10 + digit(d[at + 6]);
-        let day = digit(d[at + 8]) * 10 + digit(d[at + 9]);
+        let day_index = if d[at + 6] == b'0' {
+            digit(d[at + 9])
+        } else {
+            digit(d[at + 9]) + 1
+        };
         let hour_of_day = digit(d[at + 11]) * 10 + digit(d[at + 12]);
-        let day_index = if month == 10 { day - 30 } else { day + 1 };
         let hour = (day_index * 24 + hour_of_day - 18) as u8;
-        at += 28;
+        at += 28 + 3; // method min len 3
         while d[at] != b' ' {
             at += 1; // method
         }
@@ -212,22 +227,26 @@ fn main() {
     let width = endpoints.len();
     let buckets = HOURS * width;
 
-    // Counting sort of the latencies into buckets, in parallel. Every chunk counts its own records (and its server
-    // errors) per bucket; the counts become start positions, chunk after chunk inside each bucket; then every chunk
-    // scatters its own latencies into those private ranges.
-    let mut pos: Vec<Vec<[u32; 2]>> = thread::scope(|sc| {
+    // Single compact atomic errors array (530 KB instead of 6.4 MB per-thread error tracking)
+    let errors: Vec<AtomicU32> = (0..buckets).map(|_| AtomicU32::new(0)).collect();
+
+    // Counting sort: each thread keeps only a u32 count per bucket (6.3 MB total, 50% less memory than [u32; 2])
+    let mut pos: Vec<Vec<u32>> = thread::scope(|sc| {
         let endpoints = &endpoints;
+        let errors = &errors;
         let jobs: Vec<_> = chunks
             .iter_mut()
             .map(|c| {
                 sc.spawn(move || {
                     let rank: Vec<u32> = c.dict.names.iter().map(|n| endpoints.binary_search(n).unwrap() as u32).collect();
-                    let mut count = vec![[0u32; 2]; buckets];
+                    let mut count = vec![0u32; buckets];
                     for r in c.recs.iter_mut() {
                         let b = (r.meta >> 24 & 127) as usize * width + rank[(r.meta & 0xFF_FFFF) as usize] as usize;
-                        count[b][1] += r.meta >> 31;
+                        if r.meta >> 31 != 0 {
+                            errors[b].fetch_add(1, Ordering::Relaxed);
+                        }
                         r.meta = b as u32;
-                        count[b][0] += 1;
+                        count[b] += 1;
                     }
                     count
                 })
@@ -235,31 +254,33 @@ fn main() {
             .collect();
         jobs.into_iter().map(|j| j.join().unwrap()).collect()
     });
-    // Totals and start positions, in parallel over ranges of buckets: a thread touches only its own buckets, in every
-    // chunk's array. Prefix sums over the 132,000 bucket totals are cheap and stay sequential.
+
+    // Totals and start positions in parallel over ranges of buckets using 4-byte arrays
     let nt = pos.len().max(1);
     let per = buckets.div_ceil(nt).max(1);
-    let arrays: Vec<Disjoint<[u32; 2]>> = pos.iter_mut().map(|p| Disjoint(p.as_mut_ptr())).collect();
+    let arrays: Vec<Disjoint<u32>> = pos.iter_mut().map(|p| Disjoint(p.as_mut_ptr())).collect();
     let mut begin = vec![0u32; buckets + 1];
-    let mut errors = vec![0u32; buckets];
+
     thread::scope(|sc| {
-        for (i, (total, errs)) in begin[1..].chunks_mut(per).zip(errors.chunks_mut(per)).enumerate() {
+        for (i, total) in begin[1..].chunks_mut(per).enumerate() {
             let arrays = &arrays;
             sc.spawn(move || {
-                for (k, (t, e)) in total.iter_mut().zip(errs.iter_mut()).enumerate() {
+                for (k, t) in total.iter_mut().enumerate() {
+                    let idx = i * per + k;
+                    let mut sum = 0u32;
                     for a in arrays.iter() {
-                        // SAFETY: read only; bucket i * per + k exists in every chunk's array.
-                        let c = unsafe { *a.0.add(i * per + k) };
-                        *t += c[0];
-                        *e += c[1];
+                        sum += unsafe { *a.0.add(idx) };
                     }
+                    *t = sum;
                 }
             });
         }
     });
+
     for b in 0..buckets {
         begin[b + 1] += begin[b];
     }
+
     thread::scope(|sc| {
         for i in 0..nt {
             let (arrays, begin) = (&arrays, &begin);
@@ -267,25 +288,26 @@ fn main() {
                 for b in (i * per).min(buckets)..((i + 1) * per).min(buckets) {
                     let mut at = begin[b];
                     for a in arrays.iter() {
-                        // SAFETY: this thread is the only one that touches bucket b in any chunk's array.
                         let c = unsafe { &mut *a.0.add(b) };
-                        let n = c[0];
-                        c[0] = at; // first slot of this chunk inside bucket b
+                        let n = *c;
+                        *c = at;
                         at += n;
                     }
                 }
             });
         }
     });
+
     let mut latencies = vec![0u32; begin[buckets] as usize];
     let dst = Disjoint(latencies.as_mut_ptr());
+
+    // Scatter latencies straight into bucket slots, then drop chunks and pos immediately
     thread::scope(|sc| {
-        for (c, mut p) in chunks.iter().zip(pos) {
+        for (c, mut p) in chunks.into_iter().zip(pos) {
             sc.spawn(move || {
                 let dst = dst;
                 for r in &c.recs {
-                    let slot = &mut p[r.meta as usize][0];
-                    // SAFETY: every (chunk, bucket) pair owns its own range of `latencies`, sized by its count.
+                    let slot = &mut p[r.meta as usize];
                     unsafe { *dst.0.add(*slot as usize) = r.latency };
                     *slot += 1;
                 }
@@ -310,6 +332,7 @@ fn main() {
                 let base = begin[h0 * width] as usize;
                 sc.spawn(move || {
                     for (h, out) in (h0..h1).zip(outs.iter_mut()) {
+                        out.reserve(width * 80);
                         for (e, endpoint) in endpoints.iter().enumerate() {
                             let b = h * width + e;
                             let (lo, hi) = (begin[b] as usize - base, begin[b + 1] as usize - base);
@@ -331,7 +354,7 @@ fn main() {
                                 v[..r95 - 1].select_nth_unstable(r50 - 1);
                             }
                             let p50 = v[r50 - 1];
-                            let errs = u64::from(errors[b]);
+                            let errs = u64::from(errors[b].load(Ordering::Relaxed));
                             out.extend_from_slice(labels[h].as_bytes());
                             out.extend_from_slice(endpoint);
                             for x in [n as u64, u64::from(p50), u64::from(p95), u64::from(p99), errs, errs * 1_000_000 / n as u64] {
@@ -345,6 +368,8 @@ fn main() {
             }
         });
     }
+
+    drop(latencies);
 
     let mut f = File::create("/out/summary.txt").expect("create output");
     for out in &hour_out {
