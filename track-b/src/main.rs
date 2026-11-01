@@ -543,7 +543,9 @@ fn run<T: Tag>(vocab: &Vocab, queries: &[Query]) {
                                 let k = want.len();
                                 let rarest = *terms.iter().min_by_key(|&&t| df[t as usize]).unwrap();
                                 let candidates: Vec<u32> = bitmap(rarest).map_or_else(|| list(rarest).to_vec(), |b| docs_in(b).collect());
-                                for doc in candidates {
+                                // Only documents holding every term can match; skip the token check for the rest.
+                                let has = |t: u32, d: u32| bitmap(t).map_or_else(|| list(t).binary_search(&d).is_ok(), |b| b[(d >> 6) as usize] >> (d & 63) & 1 != 0);
+                                for doc in candidates.into_iter().filter(|&d| terms.iter().all(|&t| has(t, d))) {
                                     let s = &slices[slice_first_doc.partition_point(|&f| f <= doc) - 1];
                                     let local = (doc - s.first_doc) as usize;
                                     let tokens = &s.tokens[s.doc_start[local] as usize..s.doc_start[local + 1] as usize];
