@@ -219,7 +219,7 @@ fn main() {
                 sc.spawn(move || {
                     let mut label = vec![Label::default(); n];
                     let mut epoch = 0u32;
-                    let mut heap: BinaryHeap<Reverse<(u64, u32)>> = BinaryHeap::new();
+                    let mut heap: BinaryHeap<Reverse<u128>> = BinaryHeap::new(); // key = distance << 32 | node
                     let mut done = Vec::new();
                     loop {
                         let qi = next.fetch_add(1, Relaxed);
@@ -237,9 +237,10 @@ fn main() {
                         epoch += 1;
                         heap.clear();
                         label[s as usize] = Label { dist: 0, seen: epoch };
-                        heap.push(Reverse((0, s)));
+                        heap.push(Reverse(u128::from(s)));
                         let mut answer = -1i64;
-                        while let Some(Reverse((d, v))) = heap.pop() {
+                        while let Some(Reverse(key)) = heap.pop() {
+                            let (d, v) = ((key >> 32) as u64, key as u32);
                             if d > label[v as usize].dist {
                                 continue; // stale entry
                             }
@@ -253,7 +254,7 @@ fn main() {
                                 let l = &mut label[a.head as usize];
                                 if l.seen != epoch || nd < l.dist {
                                     *l = Label { dist: nd, seen: epoch };
-                                    heap.push(Reverse((nd, a.head)));
+                                    heap.push(Reverse(u128::from(nd) << 32 | u128::from(a.head)));
                                 }
                             }
                         }
