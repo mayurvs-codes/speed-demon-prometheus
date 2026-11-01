@@ -108,7 +108,8 @@ impl Vocab {
 #[derive(Default)]
 struct Slice {
     count: usize,         // documents scanned
-    pairs: Vec<u64>,      // term << 32 | doc, once per (term, doc)
+    first: u32,           // id of the first document scanned (ids are dense, so the rest follow)
+    pairs: Vec<u32>,      // the terms of each document, once per (term, doc), each document closed by u32::MAX
     per_term: Vec<u32>,   // number of pairs per term
     phrases: Vec<Answer>, // per phrase: the documents of this slice that contain it
     lists: Vec<u32>,      // the pairs' documents grouped by term, ascending inside each term
@@ -120,10 +121,15 @@ fn group(s: &mut Slice) {
     let mut n = 0;
     s.start = std::iter::once(0).chain(s.per_term.iter().map(|&c| { n += c; n })).collect();
     let mut at = s.start.clone();
-    s.lists = vec![0; s.pairs.len()];
-    for &p in &s.pairs {
-        s.lists[at[(p >> 32) as usize] as usize] = p as u32;
-        at[(p >> 32) as usize] += 1;
+    s.lists = vec![0; n as usize];
+    let mut doc = s.first;
+    for &t in &s.pairs {
+        if t == u32::MAX {
+            doc += 1;
+        } else {
+            s.lists[at[t as usize] as usize] = doc;
+            at[t as usize] += 1;
+        }
     }
     s.pairs = Vec::new();
 }
@@ -187,6 +193,9 @@ fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmap
             at += 1;
         }
         at += 1;
+        if s.count == 0 {
+            s.first = doc;
+        }
         s.count += 1;
         ids.clear();
         // The text runs to the newline, read 32 bytes at a time. In each block, `m` marks token bytes, and
@@ -227,7 +236,7 @@ fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmap
                     if rows[t as usize] != -2 && last_doc[t as usize] != doc + 1 {
                         last_doc[t as usize] = doc + 1;
                         if rows[t as usize] < 0 {
-                            s.pairs.push(u64::from(t) << 32 | u64::from(doc));
+                            s.pairs.push(t);
                             s.per_term[t as usize] += 1;
                         } else {
                             bitmaps[rows[t as usize] as usize * words + (doc >> 6) as usize].fetch_or(1 << (doc & 63), Relaxed);
@@ -242,6 +251,7 @@ fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmap
             }
             at += 32;
         }
+        s.pairs.push(u32::MAX);
         for (i, &t) in ids.iter().enumerate().filter(|&(_, &t)| t != u32::MAX && ph.anchored[t as usize >> 6] >> (t & 63) & 1 == 1) {
             for &(p, off) in &ph.at[t as usize] {
                 let terms = ph.terms[p as usize];
