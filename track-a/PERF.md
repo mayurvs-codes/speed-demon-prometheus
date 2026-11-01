@@ -40,6 +40,10 @@ Every step from the reference to the final version, each with the live-board run
 
 Overall (interleaved A/B on the full dataset): median 0.120 s to 0.077 s (-36%), peak RSS 297,412 KB to 150,900 KB (-49%).
 
+## Reading the log in blocks instead of mapping it (measured on the board)
+
+Each thread reads its byte range with `read_exact_at` into one 512 KB buffer, parses the whole lines in it and moves the partial last line to the front, instead of mapping the whole 239 MB file and taking a page fault per 4 KB. Endpoint names are copied into the dictionary the first time they are seen, because nothing points into a mapping any more. On the board (same code, three runs): `run-53b0453e558f` 0.0505 s, 53 MB, 69.84 points; `run-6b72bf65379e` 0.052 s, 69.52 points; `run-2f70ba7b0d17` 0.0505 s, 69.85 points. The run before it (`run-8780fa8529ae`, mapped file) was 0.0642 s and 67.65 points. A 128 KB buffer was no better (`run-757efb222f3b`: 0.0541 s, 69.01 points), so the buffer stays at 512 KB.
+
 ## Tried and reverted (the log lives in `tuning/LOG_TRACK_A.md` outside the repo)
 
 - **First two parallel counting-sort variants.** Parallel counting with the start positions still computed by one thread. No gain (0.096 s to 0.096 s, then 0.094 s): the single-threaded start-position loop still took about 17 ms; the third variant parallelised it and is the one kept.
