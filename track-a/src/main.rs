@@ -132,7 +132,7 @@ fn read_chunk(d: &'static [u8], mut at: usize, end: usize) -> Chunk {
     while at < end {
         // Behind us the pages are finished with: hand whole pages back (MADV_DONTNEED drops only this process's
         // mapping; the file stays in the page cache), so the input never sits fully resident.
-        if at - released >= 1 << 19 {
+        if at - released >= 1 << 22 {
             let (lo, hi) = ((released + 4095) & !4095, at & !4095);
             unsafe { madvise(d.as_ptr().add(lo) as *mut u8, hi - lo, 4) };
             released = at;
