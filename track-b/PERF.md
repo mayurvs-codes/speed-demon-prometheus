@@ -96,3 +96,12 @@ Board result of steps 13 and 14 together (commit `319d3c8`): run `run-cf8b774d51
 Local A/B of steps 15 and 16 against commit `d99dcc3` (Docker, volume copy of b_full, 15 interleaved runs, median): wall 0.373 -> 0.327 s (-12%), CPU (user+sys) 2.758 -> 2.227 s (-19%), peak RSS 139,116 -> 140,988 KB (+1.4%). Docker on Windows is noisy (single runs 0.27 to 0.47 s), so these are directional; the board decides. Tried and dropped: prefetch in the posting grouping (+5% slower), plain stores instead of atomic bitmap updates (-1.3%), a smaller sampling pass (-1.5%).
 
 Board result of steps 15 and 16 together (commit `a05dc18`): run `run-a94d0c6c64fc`, T = 0.301 s (was 0.328 s), M = 142 MB (was 160 MB), 61.95 points (was 60.69); every gate passed. Locally the steps gave -12% wall; on the board the gain was about -8%.
+
+## Phrase anchors found in the recording loop (commit `ed0831c`)
+
+The phrase check used to be a second pass over every token of a document, although a term that anchors a phrase is almost never present (under 1 million of 37 million tokens). A flag in each term's state now marks anchor terms, and the recording loop, which already loads that state, collects their positions, so only those positions are checked. Measured inside the container on the full data, 15 runs each: median 262 ms before, 252 ms after (about 4% less). On the board the change is inside the noise: `run-edc1a10ffd2f` 0.3011 s, 143.6 MB, 61.86 points, against 0.304 to 0.306 s and 61.7 to 61.9 points before.
+
+## Tried on the board and reverted
+
+- **Block reads instead of mmap** (commit `30489b9`, `run-6ddc8743c1a8`): 0.3493 s, 60.03 points, against about 0.30 s with the mapped file, so it was slower and went back.
+- **Where the time goes** (local profile, full data): about 20 ms to parse the queries and build the vocabulary, 7 ms for the sample pass, 170 ms for the scan, 40 ms to answer the queries. In the scan, tokenizing is about 45% of the cycles, recording terms about 30%, grouping about 5%. A cheaper hash for the query words and renumbering the vocabulary in place saved under 5 ms in the container, so they were not kept.
