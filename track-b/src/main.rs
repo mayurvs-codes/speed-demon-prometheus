@@ -116,6 +116,13 @@ struct Slice {
     start: Vec<u32>,      // term t's documents are lists[start[t]..start[t + 1]]
 }
 
+/// What one scanning thread knows about a term.
+struct TermState {
+    last_doc: u32, // doc + 1 of the last pair
+    row: i32,      // bitmap row, -1 for none, -2 for a term no BOOL query uses
+    pairs: u32,    // pairs recorded
+}
+
 /// Groups a slice's pairs by term with a counting sort. The pairs are in document order, so each group stays ascending.
 fn group(s: &mut Slice) {
     let mut n = 0;
@@ -174,8 +181,9 @@ unsafe fn token_key(d: &[u8], at: usize, len: usize) -> (u64, u64) {
 /// records one (term, document) pair; a term that no BOOL query uses (`rows[t] == -2`) needs neither. Phrases are matched
 /// as each document ends.
 fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmaps: &[AtomicU64], words: usize, ph: &Phrases) -> Slice {
-    let mut s = Slice { per_term: vec![0; vocab.words.len()], phrases: (0..ph.terms.len()).map(|_| Answer::default()).collect(), ..Default::default() };
-    let mut last_doc = vec![0u32; vocab.words.len()]; // doc + 1 of the last pair per term
+    let mut s = Slice { phrases: (0..ph.terms.len()).map(|_| Answer::default()).collect(), ..Default::default() };
+    // Everything the scan keeps per term sits together, so a token costs one cache miss here.
+    let mut state: Vec<TermState> = rows.iter().map(|&row| TermState { last_doc: 0, row, pairs: 0 }).collect();
     let mut last_match = vec![0u32; ph.terms.len()]; // doc + 1 of the last match per phrase
     let mut ids: Vec<u32> = Vec::new(); // the current document's term ids (u32::MAX for a token no query uses)
     let mut released = at;
@@ -232,17 +240,6 @@ fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmap
                     None
                 };
                 ids.push(found.unwrap_or(u32::MAX));
-                if let Some(t) = found {
-                    if rows[t as usize] != -2 && last_doc[t as usize] != doc + 1 {
-                        last_doc[t as usize] = doc + 1;
-                        if rows[t as usize] < 0 {
-                            s.pairs.push(t);
-                            s.per_term[t as usize] += 1;
-                        } else {
-                            bitmaps[rows[t as usize] as usize * words + (doc >> 6) as usize].fetch_or(1 << (doc & 63), Relaxed);
-                        }
-                    }
-                }
             }
             carry = m >> 31;
             if stop < 32 {
@@ -250,6 +247,25 @@ fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmap
                 break;
             }
             at += 32;
+        }
+        // Record the document's terms, with the state entry a few tokens ahead already on its way from memory.
+        for (i, &t) in ids.iter().enumerate() {
+            if let Some(&next) = ids.get(i + 8) {
+                unsafe { _mm_prefetch(state.as_ptr().wrapping_add(next as usize) as *const i8, _MM_HINT_T0) };
+            }
+            if t == u32::MAX {
+                continue;
+            }
+            let e = &mut state[t as usize];
+            if e.row != -2 && e.last_doc != doc + 1 {
+                e.last_doc = doc + 1;
+                if e.row < 0 {
+                    s.pairs.push(t);
+                    e.pairs += 1;
+                } else {
+                    bitmaps[e.row as usize * words + (doc >> 6) as usize].fetch_or(1 << (doc & 63), Relaxed);
+                }
+            }
         }
         s.pairs.push(u32::MAX);
         for (i, &t) in ids.iter().enumerate().filter(|&(_, &t)| t != u32::MAX && ph.anchored[t as usize >> 6] >> (t & 63) & 1 == 1) {
@@ -262,6 +278,7 @@ fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmap
             }
         }
     }
+    s.per_term = state.iter().map(|e| e.pairs).collect();
     s
 }
 
