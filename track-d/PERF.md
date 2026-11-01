@@ -2,7 +2,7 @@
 
 Every step from the reference to the final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way the log says it did.
 
-**Board results: TODO.** No run ID or board number has been recorded yet. Fill the Run ID, T and M columns from the live board after pushing; the "Local measurements" section below is from one laptop and is only for comparing changes against each other.
+**Board result, all tuning steps combined (commit `bbb8ff3`): run `run-fb6f9ba5cfc5`.** T = 0.507 s, M = 309 MB, K = 11.1, 52.2 points; every gate passed. The Run ID, T and M columns in the step table below are still TODO: the steps were tuned locally and have not each been measured on the board yet, so they are left blank rather than guessed. The "Local measurements" section is from one laptop and is only for comparing changes against each other.
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
