@@ -1,6 +1,7 @@
 // Track D: Traverse.
 // Parallel parse of graph.txt into a CSR adjacency, then one early-stopping Dijkstra per
 // query. Queries are shared between threads through an atomic counter.
+use std::arch::x86_64::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::File;
@@ -138,6 +139,13 @@ fn main() {
         let mut head = old_of.len() - 1;
         while head < old_of.len() {
             let v = old_of[head] as usize;
+            // The queue says which nodes come next, so fetch their data early: offsets 16 nodes ahead, arcs 8 ahead.
+            if let Some(&w) = old_of.get(head + 16) {
+                unsafe { _mm_prefetch::<{ _MM_HINT_T0 }>(first.as_ptr().add(w as usize) as *const i8) };
+            }
+            if let Some(&u) = old_of.get(head + 8) {
+                unsafe { _mm_prefetch::<{ _MM_HINT_T0 }>(arcs.as_ptr().add(first[u as usize] as usize) as *const i8) };
+            }
             head += 1;
             for a in &arcs[first[v] as usize..first[v + 1] as usize] {
                 let h = a.head as usize;
