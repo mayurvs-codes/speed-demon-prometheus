@@ -90,7 +90,9 @@ Board result of steps 13 and 14 together (commit `319d3c8`): run `run-cf8b774d51
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
-| 15 | After the sampling pass, terms are numbered by falling sampled frequency (vocabulary table and queries are renumbered). The few thousand common words that make up most tokens now keep their per-term state next to each other, so it stays in cache. Local: wall -7%, CPU -11% | TODO | TODO | TODO | |
-| 16 | The scan only tokenizes and looks terms up while it reads a document; recording the document's terms (last-seen stamp, bitmap bit or pair) is a second loop over the document's term ids, with each term's state (now one 12-byte struct) prefetched 8 tokens ahead. Local: wall -13%, CPU -13% | TODO | TODO | TODO | |
+| 15 | After the sampling pass, terms are numbered by falling sampled frequency (vocabulary table and queries are renumbered). The few thousand common words that make up most tokens now keep their per-term state next to each other, so it stays in cache. Local: wall -7%, CPU -11% | see combined run below | | | |
+| 16 | The scan only tokenizes and looks terms up while it reads a document; recording the document's terms (last-seen stamp, bitmap bit or pair) is a second loop over the document's term ids, with each term's state (now one 12-byte struct) prefetched 8 tokens ahead. Local: wall -13%, CPU -13% | `run-a94d0c6c64fc` (steps 15 and 16 together, commit `a05dc18`) | 0.301 | 142 | 61.95 |
 
 Local A/B of steps 15 and 16 against commit `d99dcc3` (Docker, volume copy of b_full, 15 interleaved runs, median): wall 0.373 -> 0.327 s (-12%), CPU (user+sys) 2.758 -> 2.227 s (-19%), peak RSS 139,116 -> 140,988 KB (+1.4%). Docker on Windows is noisy (single runs 0.27 to 0.47 s), so these are directional; the board decides. Tried and dropped: prefetch in the posting grouping (+5% slower), plain stores instead of atomic bitmap updates (-1.3%), a smaller sampling pass (-1.5%).
+
+Board result of steps 15 and 16 together (commit `a05dc18`): run `run-a94d0c6c64fc`, T = 0.301 s (was 0.328 s), M = 142 MB (was 160 MB), 61.95 points (was 60.69); every gate passed. Locally the steps gave -12% wall; on the board the gain was about -8%.
