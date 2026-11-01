@@ -62,7 +62,6 @@ struct Slot {
 /// (very rare) are kept in a HashMap. Tokens never contain a zero byte, so zero padding is unambiguous.
 struct Vocab {
     words: Vec<Vec<u8>>,
-    phrase_tag: Vec<u32>, // 0 = not used in a phrase, else its rank among the phrase terms (1-based)
     slots: Vec<Slot>,
     bits: u32,
     long: HashMap<Vec<u8>, u32>,
@@ -111,29 +110,21 @@ impl Vocab {
     }
 }
 
-/// The integer type of a phrase tag in the per-token sequence: u16 when the phrase terms' ranks fit, else u32.
-trait Tag: Copy + Default + PartialEq + Send + Sync {
-    fn new(rank: u32) -> Self;
-}
-impl Tag for u16 {
-    fn new(rank: u32) -> Self {
-        rank as u16 // only used when every rank is below 65,536
-    }
-}
-impl Tag for u32 {
-    fn new(rank: u32) -> Self {
-        rank
-    }
-}
-
 /// What one scanning thread produced from its slice of documents.
 #[derive(Default)]
-struct Slice<T> {
-    first_doc: u32,
-    tokens: Vec<T>,       // per token: phrase-term rank, or 0 for anything else
-    doc_start: Vec<u32>,  // docs + 1 offsets into `tokens`
+struct Slice {
+    docs: usize,
     pairs: Vec<u64>,      // term << 32 | doc, once per (term, doc)
     per_term: Vec<u32>,   // number of pairs per term
+    phrases: Vec<Answer>, // per phrase: the documents of this slice that contain it
+}
+
+/// The phrases, found while scanning: each is anchored on its rarest term, so a document is only inspected for a phrase
+/// where that term occurs.
+struct Phrases<'a> {
+    terms: Vec<&'a [u32]>,
+    anchored: Vec<u64>,           // bit t: term t anchors some phrase
+    at: Vec<Vec<(u32, usize)>>,   // per term: (phrase, offset of the term inside the phrase)
 }
 
 /// Bit i of the result is set when byte i of `v` is an ASCII letter or digit (a token byte).
@@ -164,13 +155,14 @@ unsafe fn token_key(d: &[u8], at: usize, len: usize) -> (u64, u64) {
     (_mm_cvtsi128_si64(k) as u64, _mm_extract_epi64(k, 1) as u64)
 }
 
-/// Scans the documents in d[at..end]. A term with a bitmap row (`rows[t] >= 0`) sets its bit directly; every other
-/// term records one (term, document) pair.
-fn scan<T: Tag>(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmaps: &[AtomicU64], words: usize) -> Slice<T> {
-    let mut s = Slice { per_term: vec![0; vocab.words.len()], doc_start: vec![0], ..Default::default() };
-    s.tokens.reserve((end - at) / 6);
+/// Scans the documents in d[at..end]. A term with a bitmap row (`rows[t] >= 0`) sets its bit directly; a term with no row
+/// records one (term, document) pair; a term that no BOOL query uses (`rows[t] == -2`) needs neither. Phrases are matched
+/// as each document ends.
+fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmaps: &[AtomicU64], words: usize, ph: &Phrases) -> Slice {
+    let mut s = Slice { per_term: vec![0; vocab.words.len()], phrases: (0..ph.terms.len()).map(|_| Answer::default()).collect(), ..Default::default() };
     let mut last_doc = vec![0u32; vocab.words.len()]; // doc + 1 of the last pair per term
-    let mut first = true;
+    let mut last_match = vec![0u32; ph.terms.len()]; // doc + 1 of the last match per phrase
+    let mut ids: Vec<u32> = Vec::new(); // the current document's term ids (u32::MAX for a token no query uses)
     let mut released = at;
     while at < end {
         // Behind us the pages are finished with: hand whole pages back (MADV_DONTNEED drops only this process's
@@ -186,10 +178,8 @@ fn scan<T: Tag>(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32]
             at += 1;
         }
         at += 1;
-        if first {
-            s.first_doc = doc;
-            first = false;
-        }
+        s.docs += 1;
+        ids.clear();
         // The text runs to the newline, read 32 bytes at a time. In each block, `m` marks token bytes, and
         // `m ^ (m << 1 | carry)` marks every token start and end (carry = the token continues from the last block).
         let (mut open, mut carry) = (0usize, 0u32);
@@ -223,10 +213,9 @@ fn scan<T: Tag>(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32]
                 } else {
                     None
                 };
-                let mut tag = T::default();
+                ids.push(found.unwrap_or(u32::MAX));
                 if let Some(t) = found {
-                    tag = T::new(vocab.phrase_tag[t as usize]);
-                    if last_doc[t as usize] != doc + 1 {
+                    if rows[t as usize] != -2 && last_doc[t as usize] != doc + 1 {
                         last_doc[t as usize] = doc + 1;
                         if rows[t as usize] < 0 {
                             s.pairs.push(u64::from(t) << 32 | u64::from(doc));
@@ -236,7 +225,6 @@ fn scan<T: Tag>(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32]
                         }
                     }
                 }
-                s.tokens.push(tag);
             }
             carry = m >> 31;
             if stop < 32 {
@@ -245,7 +233,15 @@ fn scan<T: Tag>(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32]
             }
             at += 32;
         }
-        s.doc_start.push(s.tokens.len() as u32);
+        for (i, &t) in ids.iter().enumerate().filter(|&(_, &t)| t != u32::MAX && ph.anchored[t as usize >> 6] >> (t & 63) & 1 == 1) {
+            for &(p, off) in &ph.at[t as usize] {
+                let terms = ph.terms[p as usize];
+                if i >= off && ids.get(i - off..i - off + terms.len()) == Some(terms) && last_match[p as usize] != doc + 1 {
+                    last_match[p as usize] = doc + 1;
+                    s.phrases[p as usize].push(doc);
+                }
+            }
+        }
     }
     s
 }
@@ -326,9 +322,8 @@ fn main() {
     let Some(query_text) = map("/data/queries.txt") else { std::process::exit(1) };
 
     // 1. Queries and vocabulary.
-    let mut vocab = Vocab { words: Vec::new(), phrase_tag: Vec::new(), slots: Vec::new(), bits: 0, long: HashMap::new() };
+    let mut vocab = Vocab { words: Vec::new(), slots: Vec::new(), bits: 0, long: HashMap::new() };
     let mut queries: Vec<Query> = Vec::new();
-    let mut phrase_terms = 0u32;
     {
         let mut ids: HashMap<&[u8], u32> = HashMap::new();
         for line in query_text.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
@@ -349,28 +344,19 @@ fn main() {
                 }
                 let t = *ids.entry(w).or_insert_with(|| {
                     vocab.words.push(w.to_vec());
-                    vocab.phrase_tag.push(0);
                     vocab.words.len() as u32 - 1
                 });
-                if phrase && vocab.phrase_tag[t as usize] == 0 {
-                    phrase_terms += 1;
-                    vocab.phrase_tag[t as usize] = phrase_terms;
-                }
                 terms.push(t);
             }
             queries.push(if phrase { Query::Phrase(terms) } else { Query::Bool { terms, ops } });
         }
     }
     vocab.index();
-    if phrase_terms < 1 << 16 {
-        run::<u16>(&vocab, &queries);
-    } else {
-        run::<u32>(&vocab, &queries);
-    }
+    run(&vocab, &queries);
 }
 
-/// Everything after the query parse, for tags of type T, so the answer never depends on the vocabulary size.
-fn run<T: Tag>(vocab: &Vocab, queries: &[Query]) {
+/// Everything after the query parse.
+fn run(vocab: &Vocab, queries: &[Query]) {
     let n_terms = vocab.words.len();
 
     // 2. Choose the frequent terms. A short sample of each thread's slice estimates document frequencies. A term
@@ -389,37 +375,58 @@ fn run<T: Tag>(vocab: &Vocab, queries: &[Query]) {
     let n_docs = if docs.is_empty() { 0 } else { docs[last_line..].iter().take_while(|c| c.is_ascii_digit()).fold(0, |a, &c| a * 10 + usize::from(c - b'0')) + 1 };
     let words_per_bitmap = n_docs.div_ceil(64);
     let no_rows = vec![-1i32; n_terms];
-    let sample: Vec<Slice<T>> = thread::scope(|sc| {
-        let (vocab, cut, no_rows) = (&vocab, &cut, &no_rows);
+    let no_phrases = Phrases { terms: Vec::new(), anchored: vec![0; n_terms.div_ceil(64)], at: Vec::new() };
+    let sample: Vec<Slice> = thread::scope(|sc| {
+        let (vocab, cut, no_rows, no_phrases) = (&vocab, &cut, &no_rows, &no_phrases);
         let jobs: Vec<_> = (0..threads)
             .map(|i| {
                 sc.spawn(move || {
                     let (b, e) = (cut[i], cut[i + 1]);
                     let mid = b + (e - b) / 32;
                     let stop = docs[mid..e].iter().position(|&c| c == b'\n').map_or(e, |k| mid + k + 1);
-                    scan(docs, b, stop, vocab, no_rows, &[], 0)
+                    scan(docs, b, stop, vocab, no_rows, &[], 0, no_phrases)
                 })
             })
             .collect();
         jobs.into_iter().map(|j| j.join().unwrap()).collect()
     });
-    let sampled_docs: usize = sample.iter().map(|s| s.doc_start.len() - 1).sum();
+    let sampled_docs: usize = sample.iter().map(|s| s.docs).sum();
+    let seen: Vec<usize> = (0..n_terms).map(|t| sample.iter().map(|s| s.per_term[t] as usize).sum()).collect();
+    drop(sample);
+    let mut in_bool = vec![false; n_terms];
+    for q in queries {
+        if let Query::Bool { terms, .. } = q {
+            terms.iter().for_each(|&t| in_bool[t as usize] = true);
+        }
+    }
     let mut rows = vec![-1i32; n_terms];
     let mut n_dense = 0;
     for t in 0..n_terms {
-        let seen: usize = sample.iter().map(|s| s.per_term[t] as usize).sum();
-        if seen > 0 && seen * n_docs >= 2 * words_per_bitmap * sampled_docs {
+        if !in_bool[t] {
+            rows[t] = -2;
+        } else if seen[t] > 0 && seen[t] * n_docs >= 2 * words_per_bitmap * sampled_docs {
             rows[t] = n_dense;
             n_dense += 1;
         }
     }
-    drop(sample);
+    // Each phrase is anchored on the term the sample saw least.
+    let mut ph = Phrases { terms: Vec::new(), anchored: vec![0; n_terms.div_ceil(64)], at: vec![Vec::new(); n_terms] };
+    let mut phrase_of = vec![0usize; queries.len()];
+    for (qi, q) in queries.iter().enumerate() {
+        if let Query::Phrase(terms) = q {
+            let anchor = *terms.iter().min_by_key(|&&t| seen[t as usize]).unwrap();
+            phrase_of[qi] = ph.terms.len();
+            ph.at[anchor as usize].push((ph.terms.len() as u32, terms.iter().position(|&t| t == anchor).unwrap()));
+            ph.anchored[anchor as usize >> 6] |= 1 << (anchor & 63);
+            ph.terms.push(terms);
+        }
+    }
 
     // 3. Scan the documents.
     let bitmaps: Vec<AtomicU64> = (0..n_dense as usize * words_per_bitmap).map(|_| AtomicU64::new(0)).collect();
-    let slices: Vec<Slice<T>> = thread::scope(|sc| {
-        let (vocab, cut, rows, bitmaps) = (&vocab, &cut, &rows, &bitmaps);
-        let jobs: Vec<_> = (0..threads).map(|i| sc.spawn(move || scan(docs, cut[i], cut[i + 1], vocab, rows, bitmaps, words_per_bitmap))).collect();
+    let slices: Vec<Slice> = thread::scope(|sc| {
+        let (vocab, cut, rows, bitmaps, ph) = (&vocab, &cut, &rows, &bitmaps, &ph);
+        let jobs: Vec<_> = (0..threads).map(|i| sc.spawn(move || scan(docs, cut[i], cut[i + 1], vocab, rows, bitmaps, words_per_bitmap, ph))).collect();
         jobs.into_iter().map(|j| j.join().unwrap()).collect()
     });
 
@@ -457,18 +464,10 @@ fn run<T: Tag>(vocab: &Vocab, queries: &[Query]) {
     slices.iter_mut().for_each(|s| s.pairs = Vec::new());
 
     let bitmaps: Vec<u64> = bitmaps.iter().map(|w| w.load(Relaxed)).collect();
-    let df: Vec<usize> = (0..n_terms)
-        .map(|t| match rows[t] {
-            -1 => list_start[t + 1] - list_start[t],
-            r => bitmaps[r as usize * words_per_bitmap..][..words_per_bitmap].iter().map(|w| w.count_ones() as usize).sum(),
-        })
-        .collect();
 
     // 5. Answer the queries.
-    let slice_first_doc: Vec<u32> = slices.iter().map(|s| s.first_doc).collect();
     let next = AtomicUsize::new(0);
-    let (queries, list_start, postings, bitmaps, rows, df, slices, slice_first_doc, next, phrase_tag) =
-        (&queries, &list_start, &postings, &bitmaps, &rows, &df, &slices, &slice_first_doc, &next, &vocab.phrase_tag);
+    let (queries, list_start, postings, bitmaps, rows, slices, phrase_of, next) = (&queries, &list_start, &postings, &bitmaps, &rows, &slices, &phrase_of, &next);
     let answered: Vec<Vec<(usize, Vec<u8>)>> = thread::scope(|sc| {
         let jobs: Vec<_> = (0..threads)
             .map(|_| {
@@ -538,20 +537,11 @@ fn run<T: Tag>(vocab: &Vocab, queries: &[Query]) {
                                     run.iter().enumerate().filter(|&(_, &w)| w != 0).for_each(|(i, &w)| ans.push_word(i as u32 * 64, w));
                                 }
                             }
-                            Query::Phrase(terms) => {
-                                let want: Vec<T> = terms.iter().map(|&t| T::new(phrase_tag[t as usize])).collect();
-                                let k = want.len();
-                                let rarest = *terms.iter().min_by_key(|&&t| df[t as usize]).unwrap();
-                                let candidates: Vec<u32> = bitmap(rarest).map_or_else(|| list(rarest).to_vec(), |b| docs_in(b).collect());
-                                // Only documents holding every term can match; skip the token check for the rest.
-                                let has = |t: u32, d: u32| bitmap(t).map_or_else(|| list(t).binary_search(&d).is_ok(), |b| b[(d >> 6) as usize] >> (d & 63) & 1 != 0);
-                                for doc in candidates.into_iter().filter(|&d| terms.iter().all(|&t| has(t, d))) {
-                                    let s = &slices[slice_first_doc.partition_point(|&f| f <= doc) - 1];
-                                    let local = (doc - s.first_doc) as usize;
-                                    let tokens = &s.tokens[s.doc_start[local] as usize..s.doc_start[local + 1] as usize];
-                                    if tokens.len() >= k && (0..=tokens.len() - k).any(|i| tokens[i] == want[0] && tokens[i + 1..i + k] == want[1..]) {
-                                        ans.push(doc);
-                                    }
+                            Query::Phrase(_) => {
+                                for s in slices.iter().map(|s| &s.phrases[phrase_of[qi]]) {
+                                    ans.count += s.count;
+                                    ans.sum += s.sum;
+                                    ans.smallest.extend(s.smallest.iter().take(10 - ans.smallest.len()));
                                 }
                             }
                         }

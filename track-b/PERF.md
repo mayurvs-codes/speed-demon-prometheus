@@ -15,6 +15,8 @@ Every step from the reference to the final version, each with the live-board run
 | 6 | Count and sum BOOL results per 64-bit word with popcounts | TODO | TODO | TODO | |
 | 7 | Phrase tags as `u16` ranks (generic, falls back to `u32`) | TODO | TODO | TODO | |
 | 8 | Stop a BOOL query early when its result is empty and no OR remains | TODO | TODO | TODO | |
+| 9 | Write all result lines with one `write` | run-5be09f50b1ae | 0.334 | 309 | 57.74 |
+| 10 | Check a phrase only in documents that hold all its terms | run-f4f6d4549d46 | 0.313 | 307 | 58.43 |
 
 ## Why each change helped
 
@@ -26,6 +28,8 @@ Every step from the reference to the final version, each with the live-board run
 6. **Count and sum BOOL results per 64-bit word with popcounts.** 88 million result bits were visited one at a time; a word is now counted and summed in a handful of instructions and only the first ten ids are collected bit by bit.
 7. **Phrase tags as `u16` ranks (generic, falls back to `u32`).** The per-token sequence was the largest array (145 MB) and phrase matching reads it at random, so halving it halves the cache misses.
 8. **Stop a BOOL query early when its result is empty and no OR remains.** About 23% of BOOL answers are empty; an empty set stays empty under AND and NOT, so the remaining work is skipped.
+9. **Write all result lines with one `write`.** The 50,000 lines were written with one system call each; they are now joined and written once (board 0.411 s to 0.334 s).
+10. **Check a phrase only in documents that hold all its terms.** The old code scanned the token sequence of every document that holds the rarest word; most of them lack another word, which a bitmap bit test or a binary search in a posting list rules out first (about 4 of 5 candidates dropped; board 0.334 s to 0.313 s).
 
 ## Local measurements (AMD Ryzen 7 6800H laptop, 12 threads; the scoring box is an i5-13500, so these are directional only)
 
@@ -43,6 +47,8 @@ Every step from the reference to the final version, each with the live-board run
 Overall (interleaved A/B on the full dataset): median 0.61 s to 0.40 s (-34%), peak RSS 707,900 KB to 284,868 KB (-60%).
 
 ## Tried and reverted (the log lives in `tuning/LOG_TRACK_B.md` outside the repo)
+
+- **Prefetch a document's table slots before the lookups.** Collect a document's token keys, prefetch their slots, then look them up. 7% faster on the laptop, no change on the board (run-aa7e06dd6e42: 0.336 s against 0.334 s, 57.58 points against 57.74); the scoring box's larger L2 cache already holds the table.
 
 - **Length / first-byte filter.** Reject non-terms before hashing. 79% of tokens are query terms, so a filter could reject at most 21%.
 - **`process::exit` after the output.** Skip the destructors. No gain; the kernel frees the memory either way.
