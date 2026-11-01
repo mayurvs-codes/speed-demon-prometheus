@@ -12,6 +12,7 @@ use std::thread;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
 /// Maps a file read-only into memory (std has no mmap, so this declares the libc call).
@@ -21,8 +22,8 @@ fn map(path: &str) -> Option<&'static [u8]> {
     if len == 0 {
         return None;
     }
-    // PROT_READ, MAP_PRIVATE | MAP_POPULATE
-    let p = unsafe { mmap(std::ptr::null_mut(), len, 1, 0x2 | 0x8000, f.as_raw_fd(), 0) };
+    // PROT_READ, MAP_PRIVATE
+    let p = unsafe { mmap(std::ptr::null_mut(), len, 1, 0x2, f.as_raw_fd(), 0) };
     (p as isize != -1).then(|| unsafe { std::slice::from_raw_parts(p, len) })
 }
 
@@ -84,7 +85,15 @@ fn main() {
                 sc.spawn(move || {
                     let mut edges = Vec::with_capacity(m / threads + m / threads / 8 + 64);
                     let (mut i, end) = (cut[t], cut[t + 1]);
+                    let mut released = i;
                     while i < end {
+                        // Behind us the pages are finished with: hand whole pages back (MADV_DONTNEED drops only this process's
+                        // mapping; the file stays in the page cache), so the input never sits fully resident.
+                        if i - released >= 1 << 22 {
+                            let (lo, hi) = ((released + 4095) & !4095, i & !4095);
+                            unsafe { madvise(g.as_ptr().add(lo) as *mut u8, hi - lo, 4) };
+                            released = i;
+                        }
                         let u = num(g, &mut i) as u32;
                         let v = num(g, &mut i) as u32;
                         let w = num(g, &mut i) as u32;
