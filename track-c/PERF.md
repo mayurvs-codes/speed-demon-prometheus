@@ -12,6 +12,8 @@ Every step from the reference to the final version, each with the live-board run
 | 3 | Hand finished input pages back with `madvise(MADV_DONTNEED)` every 4 MB | TODO | TODO | TODO | |
 | 4 | Find quotes and commas 32 bytes at a time (AVX2) | TODO | TODO | TODO | |
 | 5 | Reserve each shard's key capacity up front | TODO | TODO | TODO | |
+| 6 | Compute unescaped note length directly without scratch buffer copies | TODO | TODO | TODO | |
+| 7 | Build region table directly without intermediate region_rows vector | TODO | TODO | TODO | |
 
 ## Why each change helped
 
@@ -20,6 +22,8 @@ Every step from the reference to the final version, each with the live-board run
 3. **Hand finished input pages back with `madvise(MADV_DONTNEED)` every 4 MB.** Each byte is read once, so the input does not need to stay resident; the page cache is untouched.
 4. **Find quotes and commas 32 bytes at a time (AVX2).** Notes average about 60 bytes and were walked byte by byte to find the closing quote.
 5. **Reserve each shard's key capacity up front.** The 144 key vectors grew by doubling, which means repeated reallocation, copying and page faults.
+6. **Compute unescaped note length directly without scratch buffer copies.** Notes average ~60 bytes and frequently contain quotes; since notes are not hashed, their unescaped length is directly calculated as raw byte length minus quote escape count, avoiding scratch buffer copies and reallocations across 3.32M records.
+7. **Build region table directly without intermediate region_rows vector.** Scanning `regions.csv` in two fast passes avoids allocating and repeatedly doubling the 200,000-element `Vec<(usize, usize)>` intermediate vector (saving ~3.2 MB heap allocation and lowering cgroup peak memory).
 
 ## Local measurements (AMD Ryzen 7 6800H laptop, 12 threads; the scoring box is an i5-13500, so these are directional only)
 
@@ -30,13 +34,20 @@ Every step from the reference to the final version, each with the live-board run
 | 3 | 0.072 s to 0.065 s | RSS 263,040 KB to 69,988 KB (-73%) |
 | 4 | 0.067 s to 0.062 s (-7%) | unchanged |
 | 5 | 0.063 s to 0.059 s (-6%) | RSS -5% |
+| 6 | 0.078 s to 0.065 s (-15.7%) | unchanged |
+| 7 | 0.065 s to 0.064 s (-2.6%) | Cgroup peak 59.6 MB to 56.8 MB (-4.8%) |
 
 Overall (interleaved A/B on the full dataset): median 0.10 s to 0.059 s (-41%; mean 0.110 s to 0.059 s), peak RSS 267,992 KB to about 66,000 KB (-75%).
+With steps 6-7 on Docker volume copy of c_full (7-run median): time 0.078 s -> 0.0637 s (-18.3%), cgroup peak 60.3 MB -> 56.8 MB (-5.8%).
 
 ## Tried and reverted (the log lives in `tuning/LOG_TRACK_C.md` outside the repo)
 
 - **Thread count.** Fewer than 12 threads. 12 threads is fastest (57-61 ms against 62-64 for 10).
 - **Coarser page release.** Release pages every 16 MB instead of 4 MB. No faster and RSS rose from 67 MB to 185 MB.
+- **Serial shard key consolidation.** Moving keys to shard vectors serially in the main thread before deduplicating added ~30 ms.
+- **Manual unchecked loops for integer parsing.** Slower than compiler-vectorized slice methods.
+- **Shard key collection with exact capacity + extend_from_slice.** Gained 1.4% (under 3% threshold).
+- **Tighter per-shard key vector reservation.** Gained 1.7% (under 3% threshold).
 
 ## Memory as the scorer counts it (cgroup `memory.peak`)
 
