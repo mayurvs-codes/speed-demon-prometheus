@@ -1,8 +1,8 @@
 // Track C: Join.
 // records.csv is mapped and cut into one chunk per thread at record starts. Each thread parses
 // its records, looks the region up in a dense table and folds the record into per-country sums.
-// Distinct names are counted from 64-bit hashes of the unescaped value, split into shards that
-// are deduplicated in parallel.
+// Distinct names are counted from 64-bit hashes of the unescaped value: each thread gives every hash it sees a small
+// id and keeps one bit per (country, id); the hashes are then split into shards that merge the bits in parallel.
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
@@ -73,14 +73,47 @@ struct Join<'a> {
     country_of_region: &'a [u16],
     unmatched: u16,
     countries: usize,
-    country_bits: u32,
-    shards: usize,
+}
+
+/// Open-addressing table that gives each name hash a dense id in first-seen order.
+struct Names {
+    slots: Vec<u32>, // id + 1; 0 = empty
+    hashes: Vec<u64>,
+}
+
+impl Names {
+    fn id(&mut self, h: u64) -> usize {
+        if self.hashes.len() * 2 > self.slots.len() {
+            self.slots = vec![0; self.slots.len() * 2];
+            for (id, &h) in self.hashes.iter().enumerate() {
+                let mut i = h as usize & (self.slots.len() - 1);
+                while self.slots[i] != 0 {
+                    i = (i + 1) & (self.slots.len() - 1);
+                }
+                self.slots[i] = id as u32 + 1;
+            }
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = h as usize & mask;
+        loop {
+            match self.slots[i] {
+                0 => {
+                    self.slots[i] = self.hashes.len() as u32 + 1;
+                    self.hashes.push(h);
+                    return self.hashes.len() - 1;
+                }
+                s if self.hashes[s as usize - 1] == h => return s as usize - 1,
+                _ => i = (i + 1) & mask,
+            }
+        }
+    }
 }
 
 /// What one thread produced from its chunk.
 struct Part {
     totals: Vec<Totals>,
-    keys: Vec<Vec<u64>>, // (name hash with the country in its low bits), bucketed by shard
+    names: Vec<u64>,     // every distinct name hash seen, indexed by the thread's id for it
+    seen: Vec<Vec<u64>>, // per country, one bit per id: that name occurred in that country
     end: usize,          // where parsing stopped; must equal the next chunk's start
     ok: bool,
 }
@@ -148,12 +181,9 @@ fn field(d: &[u8], at: usize, scratch: &mut Vec<u8>, want_hash: bool) -> Option<
 }
 
 fn parse_chunk(d: &[u8], mut at: usize, end: usize, j: &Join) -> Part {
-    // A shard's keys are sorted and deduplicated whenever they reach `limit`, so the same few names are never stored
-    // millions of times; the limit doubles if a pass frees less than a quarter of the space.
-    let mut limit = vec![1usize << 14; j.shards];
-    let mut part = Part { totals: vec![Totals::NONE; j.countries], keys: (0..j.shards).map(|_| Vec::with_capacity(1 << 14)).collect(), end: 0, ok: true };
+    let mut part = Part { totals: vec![Totals::NONE; j.countries], names: Vec::new(), seen: vec![Vec::new(); j.countries], end: 0, ok: true };
+    let mut names = Names { slots: vec![0; 1 << 12], hashes: Vec::new() };
     let mut scratch = Vec::new();
-    let country_mask = (1u64 << j.country_bits) - 1;
     let mut released = at;
     while at < end {
         // Behind us the pages are finished with: hand whole pages back (MADV_DONTNEED drops only this process's
@@ -207,22 +237,14 @@ fn parse_chunk(d: &[u8], mut at: usize, end: usize, j: &Join) -> Part {
         t.cents_sum += cents;
         t.cents_min = t.cents_min.min(cents);
         t.cents_max = t.cents_max.max(cents);
-        let key = (name_hash & !country_mask) | country as u64;
-        let shard = ((key >> j.country_bits) % j.shards as u64) as usize;
-        let keys = &mut part.keys[shard];
-        keys.push(key);
-        if keys.len() == limit[shard] {
-            keys.sort_unstable();
-            keys.dedup();
-            if keys.len() > limit[shard] / 4 * 3 {
-                limit[shard] *= 2;
-            }
+        let id = names.id(name_hash);
+        let bits = &mut part.seen[country];
+        if id / 64 >= bits.len() {
+            bits.resize(id / 64 + 16, 0);
         }
+        bits[id / 64] |= 1 << (id % 64);
     }
-    for keys in &mut part.keys {
-        keys.sort_unstable();
-        keys.dedup();
-    }
+    part.names = names.hashes;
     part.end = at;
     part
 }
@@ -308,7 +330,6 @@ fn main() {
         country_of_region[id] = index_of_code[code];
         at += 4;
     }
-    let country_bits = usize::BITS - (keys.len() - 1).leading_zeros();
 
     let threads = thread::available_parallelism().map_or(1, |t| t.get()).clamp(1, 12);
     let end = records.len();
@@ -316,7 +337,7 @@ fn main() {
     first += records[first..].iter().position(|&c| c == b'\n').expect("header") + 1;
 
     let parse_with = |parts: usize| -> Option<Vec<Part>> {
-        let join = Join { country_of_region: &country_of_region, unmatched, countries: keys.len(), country_bits, shards: parts };
+        let join = Join { country_of_region: &country_of_region, unmatched, countries: keys.len() };
         let mut cut = vec![first; parts + 1];
         cut[parts] = end;
         for i in 1..parts {
@@ -336,20 +357,29 @@ fn main() {
         None => (parse_with(1).expect("single-threaded parse"), 1),
     };
 
-    // Each thread owns one shard of the (name hash, country) keys: sort, dedupe, count per country.
+    // Each thread owns the name hashes that fall in one shard: it sorts them, then folds every part's bits for those
+    // names into one bit set per country and counts them.
     let distinct: Vec<Vec<u64>> = thread::scope(|sc| {
         let (parts, countries) = (&parts, keys.len());
         let jobs: Vec<_> = (0..shards)
             .map(|s| {
                 sc.spawn(move || {
-                    let mut all: Vec<u64> = parts.iter().flat_map(|p| p.keys[s].iter().copied()).collect();
+                    let mine = |h: &u64| (h % shards as u64) as usize == s;
+                    let mut all: Vec<u64> = parts.iter().flat_map(|p| p.names.iter().copied().filter(mine)).collect();
                     all.sort_unstable();
                     all.dedup();
-                    let mut per_country = vec![0u64; countries];
-                    for k in all {
-                        per_country[(k & ((1u64 << country_bits) - 1)) as usize] += 1;
+                    let mut merged = vec![vec![0u64; all.len().div_ceil(64)]; countries];
+                    for p in parts {
+                        for (id, h) in p.names.iter().enumerate().filter(|(_, h)| mine(h)) {
+                            let g = all.binary_search(h).unwrap();
+                            for (c, bits) in p.seen.iter().enumerate() {
+                                if bits.get(id / 64).is_some_and(|w| w >> (id % 64) & 1 != 0) {
+                                    merged[c][g / 64] |= 1 << (g % 64);
+                                }
+                            }
+                        }
                     }
-                    per_country
+                    merged.iter().map(|m| m.iter().map(|w| u64::from(w.count_ones())).sum()).collect()
                 })
             })
             .collect();
