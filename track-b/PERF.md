@@ -17,6 +17,7 @@ Every step from the reference to the final version, each with the live-board run
 | 8 | Stop a BOOL query early when its result is empty and no OR remains | TODO | TODO | TODO | |
 | 9 | Write all result lines with one `write` | run-5be09f50b1ae | 0.334 | 309 | 57.74 |
 | 10 | Check a phrase only in documents that hold all its terms | run-f4f6d4549d46 | 0.313 | 307 | 58.43 |
+| 11 | Match phrases while scanning, anchored on their rarest term; no per-token array, and terms used by no BOOL query keep no postings | run-24a01816d67c | 0.326 | 233 | 59.32 |
 
 ## Why each change helped
 
@@ -30,6 +31,7 @@ Every step from the reference to the final version, each with the live-board run
 8. **Stop a BOOL query early when its result is empty and no OR remains.** About 23% of BOOL answers are empty; an empty set stays empty under AND and NOT, so the remaining work is skipped.
 9. **Write all result lines with one `write`.** The 50,000 lines were written with one system call each; they are now joined and written once (board 0.411 s to 0.334 s).
 10. **Check a phrase only in documents that hold all its terms.** The old code scanned the token sequence of every document that holds the rarest word; most of them lack another word, which a bitmap bit test or a binary search in a posting list rules out first (about 4 of 5 candidates dropped; board 0.334 s to 0.313 s).
+11. **Match phrases while scanning, anchored on their rarest term.** The 36 million-entry token array (73 MB) existed only to check phrases afterwards. Each phrase is now anchored on the term the sample saw least; when that term occurs in a document, the few tokens around it are compared with the phrase right there, while the document's term ids are still in a small buffer. Memory fell 307 MB to 233 MB; time rose slightly on the board (0.313 s to 0.326 s) because the scan does a little more work per token, so the gain is in M.
 
 ## Local measurements (AMD Ryzen 7 6800H laptop, 12 threads; the scoring box is an i5-13500, so these are directional only)
 

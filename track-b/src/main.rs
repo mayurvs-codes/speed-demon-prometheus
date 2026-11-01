@@ -31,12 +31,6 @@ fn map(path: &str) -> Option<&'static [u8]> {
     (p as isize != -1).then(|| unsafe { std::slice::from_raw_parts(p, len) })
 }
 
-/// Pointer shared by threads that write to provably disjoint slots.
-#[derive(Clone, Copy)]
-struct Disjoint<T>(*mut T);
-unsafe impl<T> Send for Disjoint<T> {}
-unsafe impl<T> Sync for Disjoint<T> {}
-
 #[derive(Clone, Copy, PartialEq)]
 enum Op {
     And,
@@ -113,10 +107,25 @@ impl Vocab {
 /// What one scanning thread produced from its slice of documents.
 #[derive(Default)]
 struct Slice {
-    docs: usize,
+    count: usize,         // documents scanned
     pairs: Vec<u64>,      // term << 32 | doc, once per (term, doc)
     per_term: Vec<u32>,   // number of pairs per term
     phrases: Vec<Answer>, // per phrase: the documents of this slice that contain it
+    lists: Vec<u32>,      // the pairs' documents grouped by term, ascending inside each term
+    start: Vec<u32>,      // term t's documents are lists[start[t]..start[t + 1]]
+}
+
+/// Groups a slice's pairs by term with a counting sort. The pairs are in document order, so each group stays ascending.
+fn group(s: &mut Slice) {
+    let mut n = 0;
+    s.start = std::iter::once(0).chain(s.per_term.iter().map(|&c| { n += c; n })).collect();
+    let mut at = s.start.clone();
+    s.lists = vec![0; s.pairs.len()];
+    for &p in &s.pairs {
+        s.lists[at[(p >> 32) as usize] as usize] = p as u32;
+        at[(p >> 32) as usize] += 1;
+    }
+    s.pairs = Vec::new();
 }
 
 /// The phrases, found while scanning: each is anchored on its rarest term, so a document is only inspected for a phrase
@@ -178,7 +187,7 @@ fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmap
             at += 1;
         }
         at += 1;
-        s.docs += 1;
+        s.count += 1;
         ids.clear();
         // The text runs to the newline, read 32 bytes at a time. In each block, `m` marks token bytes, and
         // `m ^ (m << 1 | carry)` marks every token start and end (carry = the token continues from the last block).
@@ -390,7 +399,7 @@ fn run(vocab: &Vocab, queries: &[Query]) {
             .collect();
         jobs.into_iter().map(|j| j.join().unwrap()).collect()
     });
-    let sampled_docs: usize = sample.iter().map(|s| s.docs).sum();
+    let sampled_docs: usize = sample.iter().map(|s| s.count).sum();
     let seen: Vec<usize> = (0..n_terms).map(|t| sample.iter().map(|s| s.per_term[t] as usize).sum()).collect();
     drop(sample);
     let mut in_bool = vec![false; n_terms];
@@ -426,53 +435,24 @@ fn run(vocab: &Vocab, queries: &[Query]) {
     let bitmaps: Vec<AtomicU64> = (0..n_dense as usize * words_per_bitmap).map(|_| AtomicU64::new(0)).collect();
     let slices: Vec<Slice> = thread::scope(|sc| {
         let (vocab, cut, rows, bitmaps, ph) = (&vocab, &cut, &rows, &bitmaps, &ph);
-        let jobs: Vec<_> = (0..threads).map(|i| sc.spawn(move || scan(docs, cut[i], cut[i + 1], vocab, rows, bitmaps, words_per_bitmap, ph))).collect();
+        let jobs: Vec<_> = (0..threads).map(|i| sc.spawn(move || {
+            let mut s = scan(docs, cut[i], cut[i + 1], vocab, rows, bitmaps, words_per_bitmap, ph);
+            group(&mut s);
+            s
+        })).collect();
         jobs.into_iter().map(|j| j.join().unwrap()).collect()
     });
 
-    // 4. Posting lists for the other terms. Slices are in document order, so each list comes out ascending.
-    let mut list_start = vec![0usize; n_terms + 1];
-    for t in 0..n_terms {
-        list_start[t + 1] = list_start[t] + slices.iter().map(|s| s.per_term[t] as usize).sum::<usize>();
-    }
-    let mut postings = vec![0u32; list_start[n_terms]];
-    {
-        let dst = Disjoint(postings.as_mut_ptr());
-        let mut cursors: Vec<Vec<usize>> = vec![vec![0; n_terms]; slices.len()];
-        for t in 0..n_terms {
-            let mut at = list_start[t];
-            for (s, cur) in slices.iter().zip(cursors.iter_mut()) {
-                cur[t] = at;
-                at += s.per_term[t] as usize;
-            }
-        }
-        thread::scope(|sc| {
-            for (s, mut cur) in slices.iter().zip(cursors) {
-                sc.spawn(move || {
-                    let dst = dst;
-                    for &p in &s.pairs {
-                        let t = (p >> 32) as usize;
-                        // SAFETY: each (term, slice) pair owns a private range of `postings`.
-                        unsafe { *dst.0.add(cur[t]) = p as u32 };
-                        cur[t] += 1;
-                    }
-                });
-            }
-        });
-    }
-    let mut slices = slices;
-    slices.iter_mut().for_each(|s| s.pairs = Vec::new());
-
     let bitmaps: Vec<u64> = bitmaps.iter().map(|w| w.load(Relaxed)).collect();
 
-    // 5. Answer the queries.
+    // 4. Answer the queries.
     let next = AtomicUsize::new(0);
-    let (queries, list_start, postings, bitmaps, rows, slices, phrase_of, next) = (&queries, &list_start, &postings, &bitmaps, &rows, &slices, &phrase_of, &next);
+    let (queries, bitmaps, rows, slices, phrase_of, next) = (&queries, &bitmaps, &rows, &slices, &phrase_of, &next);
     let answered: Vec<Vec<(usize, Vec<u8>)>> = thread::scope(|sc| {
         let jobs: Vec<_> = (0..threads)
             .map(|_| {
                 sc.spawn(move || {
-                    let list = |t: u32| &postings[list_start[t as usize]..list_start[t as usize + 1]];
+                    let list = |t: u32| slices.iter().flat_map(move |s| s.lists[s.start[t as usize] as usize..s.start[t as usize + 1] as usize].iter().copied());
                     let bitmap = |t: u32| -> Option<&[u64]> {
                         let r = rows[t as usize];
                         (r >= 0).then(|| &bitmaps[r as usize * words_per_bitmap..][..words_per_bitmap])
@@ -489,12 +469,12 @@ fn run(vocab: &Vocab, queries: &[Query]) {
                                 let run = &mut run[..words_per_bitmap];
                                 // `empty` is only set when it is known for free (an absent first term, or an AND with a short
                                 // list that leaves nothing); then `run` is all zero.
-                                let mut empty = bitmap(terms[0]).is_none() && list(terms[0]).is_empty();
+                                let mut empty = bitmap(terms[0]).is_none() && list(terms[0]).next().is_none();
                                 match bitmap(terms[0]) {
                                     Some(b) => run.copy_from_slice(b),
                                     None => {
                                         run.fill(0);
-                                        for &doc in list(terms[0]) {
+                                        for doc in list(terms[0]) {
                                             run[(doc >> 6) as usize] |= 1 << (doc & 63);
                                         }
                                     }
@@ -507,14 +487,14 @@ fn run(vocab: &Vocab, queries: &[Query]) {
                                     if empty && op != Op::Or {
                                         continue;
                                     }
-                                    empty = empty && bitmap(t).is_none() && list(t).is_empty();
+                                    empty = empty && bitmap(t).is_none() && list(t).next().is_none();
                                     match (op, bitmap(t)) {
                                         (Op::And, Some(b)) => run.iter_mut().zip(b).for_each(|(r, b)| *r &= b),
                                         (Op::Or, Some(b)) => run.iter_mut().zip(b).for_each(|(r, b)| *r |= b),
                                         (Op::Not, Some(b)) => run.iter_mut().zip(b).for_each(|(r, b)| *r &= !b),
                                         (Op::And, None) => {
                                             keep.clear();
-                                            keep.extend(list(t).iter().copied().filter(|&d| run[(d >> 6) as usize] >> (d & 63) & 1 != 0));
+                                            keep.extend(list(t).filter(|&d| run[(d >> 6) as usize] >> (d & 63) & 1 != 0));
                                             run.fill(0);
                                             for &d in &keep {
                                                 run[(d >> 6) as usize] |= 1 << (d & 63);
@@ -522,12 +502,12 @@ fn run(vocab: &Vocab, queries: &[Query]) {
                                             empty = keep.is_empty();
                                         }
                                         (Op::Or, None) => {
-                                            for &d in list(t) {
+                                            for d in list(t) {
                                                 run[(d >> 6) as usize] |= 1 << (d & 63);
                                             }
                                         }
                                         (Op::Not, None) => {
-                                            for &d in list(t) {
+                                            for d in list(t) {
                                                 run[(d >> 6) as usize] &= !(1 << (d & 63));
                                             }
                                         }
