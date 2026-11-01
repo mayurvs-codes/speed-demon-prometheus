@@ -19,8 +19,8 @@ fn map(path: &str) -> Option<&'static [u8]> {
     if len == 0 {
         return None;
     }
-    // PROT_READ, MAP_PRIVATE | MAP_POPULATE
-    let p = unsafe { mmap(std::ptr::null_mut(), len, 1, 0x2 | 0x8000, f.as_raw_fd(), 0) };
+    // PROT_READ, MAP_PRIVATE
+    let p = unsafe { mmap(std::ptr::null_mut(), len, 1, 0x2, f.as_raw_fd(), 0) };
     (p as isize != -1).then(|| unsafe { std::slice::from_raw_parts(p, len) })
 }
 
