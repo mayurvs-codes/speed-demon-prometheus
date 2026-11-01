@@ -74,3 +74,12 @@ Overall (interleaved A/B on the full dataset): median 0.61 s to 0.40 s (-34%), p
 ## Memory as the scorer counts it (cgroup `memory.peak`)
 
 The RSS figures above come from `/usr/bin/time`. The scorer reads the container's kernel peak counter instead, so it was re-measured in the board's sandbox shape (Docker Desktop VM, full-scale seed 1, three runs per build): **544.1 MB** with the `madvise` step and **544.6 MB** with the call turned into a no-op. The two agree within run-to-run noise, so handing pages back lowers RSS (about 708 MB to 285 MB) but **does not lower `memory.peak`**: the file pages stay in the page cache, which the cgroup still charges. Treat the memory gain of the `madvise` step as unproven; the board's M column is the authority. This is a local re-measurement, not a board number.
+
+## Local-only steps after run-68b6c247ebcc (not yet measured on the board)
+
+| Step | Change | Run ID | T (s) | M (MB) | Points |
+|---|---|---|---|---|---|
+| 13 | A (term, document) pair is stored as the 4-byte term id, with a marker closing each document; the document id follows from position (ids are dense). Local peak RSS 191 -> 155 MB | TODO | TODO | TODO | |
+| 14 | Corpus pages are handed back every 1 MB instead of every 4 MB. Local peak RSS 156 -> 140 MB | TODO | TODO | TODO | |
+
+Local A/B of both steps together against commit 0934019 (Docker, volume copy of b_full, 11 interleaved runs, median): 0.403 -> 0.381 s, peak RSS 192,568 -> 138,820 KB. Docker on Windows is noisy (single runs 0.33 to 0.52 s), so only the memory change is clear; the time difference is inside the noise.
