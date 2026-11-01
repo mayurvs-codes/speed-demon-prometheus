@@ -171,6 +171,7 @@ fn scan<T: Tag>(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32]
     s.tokens.reserve((end - at) / 6);
     let mut last_doc = vec![0u32; vocab.words.len()]; // doc + 1 of the last pair per term
     let mut first = true;
+    let mut keys: Vec<(u64, u64)> = Vec::new(); // the current document's token keys
     let mut released = at;
     while at < end {
         // Behind us the pages are finished with: hand whole pages back (MADV_DONTNEED drops only this process's
@@ -215,28 +216,12 @@ fn scan<T: Tag>(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32]
                     continue;
                 }
                 let len = at + b - open; // a token ended just before here
-                let found = if len <= 16 {
-                    let (lo, hi) = unsafe { token_key(d, open, len) };
-                    vocab.find(lo, hi)
-                } else if len <= 32 && !vocab.long.is_empty() {
-                    vocab.long.get(&d[open..at + b].iter().map(|c| c | 0x20).collect::<Vec<u8>>()).copied()
+                keys.push(if len <= 16 {
+                    unsafe { token_key(d, open, len) }
                 } else {
-                    None
-                };
-                let mut tag = T::default();
-                if let Some(t) = found {
-                    tag = T::new(vocab.phrase_tag[t as usize]);
-                    if last_doc[t as usize] != doc + 1 {
-                        last_doc[t as usize] = doc + 1;
-                        if rows[t as usize] < 0 {
-                            s.pairs.push(u64::from(t) << 32 | u64::from(doc));
-                            s.per_term[t as usize] += 1;
-                        } else {
-                            bitmaps[rows[t as usize] as usize * words + (doc >> 6) as usize].fetch_or(1 << (doc & 63), Relaxed);
-                        }
-                    }
-                }
-                s.tokens.push(tag);
+                    // A longer token never fits the table: the sentinel `u64::MAX` (no token has it) carries its id in `hi`.
+                    (u64::MAX, vocab.long.get(&d[open..at + b].iter().map(|c| c | 0x20).collect::<Vec<u8>>()).map_or(u64::MAX, |&t| u64::from(t)))
+                });
             }
             carry = m >> 31;
             if stop < 32 {
@@ -245,6 +230,28 @@ fn scan<T: Tag>(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32]
             }
             at += 32;
         }
+        // Look the whole document's tokens up in two passes: prefetch every table slot first, so the cache misses overlap.
+        for &(lo, hi) in &keys {
+            unsafe { _mm_prefetch::<{ _MM_HINT_T0 }>(vocab.slots.as_ptr().add(Vocab::home(lo, hi, vocab.bits)) as *const i8) };
+        }
+        for &(lo, hi) in &keys {
+            let found = if lo == u64::MAX { u32::try_from(hi).ok() } else { vocab.find(lo, hi) };
+            let mut tag = T::default();
+            if let Some(t) = found {
+                tag = T::new(vocab.phrase_tag[t as usize]);
+                if last_doc[t as usize] != doc + 1 {
+                    last_doc[t as usize] = doc + 1;
+                    if rows[t as usize] < 0 {
+                        s.pairs.push(u64::from(t) << 32 | u64::from(doc));
+                        s.per_term[t as usize] += 1;
+                    } else {
+                        bitmaps[rows[t as usize] as usize * words + (doc >> 6) as usize].fetch_or(1 << (doc & 63), Relaxed);
+                    }
+                }
+            }
+            s.tokens.push(tag);
+        }
+        keys.clear();
         s.doc_start.push(s.tokens.len() as u32);
     }
     s
