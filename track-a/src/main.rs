@@ -1,31 +1,33 @@
 // Track A: Ingest.
-// The log is mapped and cut into one chunk per thread. Each thread reduces its lines to compact
-// records (endpoint, hour, latency, error flag). Records are then counting-sorted into one bucket
+// The log is cut into one byte range per thread; each thread reads its range in small blocks (no mapping)
+// and reduces its lines to compact records (endpoint, hour, latency, error flag). Records are then counting-sorted into one bucket
 // per (hour, endpoint); percentiles come from select_nth_unstable inside each bucket, and each
 // thread formats a range of hours so the output is simply the hours in order.
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
 const HOURS: usize = 72;
 
-extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-}
+/// Bytes read per call; each thread keeps one buffer of this size (plus one partial line).
+const BLOCK: usize = 512 << 10;
 
-/// Maps a file read-only into memory (std has no mmap, so this declares the libc call).
-fn map(path: &str) -> Option<&'static [u8]> {
-    let f = File::open(path).ok()?;
-    let len = f.metadata().ok()?.len() as usize;
-    if len == 0 {
-        return None;
+/// Start of the first line that begins at or after `guess`.
+fn line_start(f: &File, guess: u64, len: u64) -> u64 {
+    let mut buf = [0u8; 512];
+    let mut at = guess;
+    while at < len {
+        let n = ((len - at) as usize).min(buf.len());
+        f.read_exact_at(&mut buf[..n], at).expect("read input");
+        if let Some(k) = buf[..n].iter().position(|&c| c == b'\n') {
+            return at + k as u64 + 1;
+        }
+        at += n as u64;
     }
-    // PROT_READ, MAP_PRIVATE
-    let p = unsafe { mmap(std::ptr::null_mut(), len, 1, 0x2, f.as_raw_fd(), 0) };
-    (p as isize != -1).then(|| unsafe { std::slice::from_raw_parts(p, len) })
+    len
 }
 
 /// Pointer shared by threads that write to provably disjoint slots.
@@ -64,7 +66,7 @@ struct Rec {
 /// Open-addressing set of endpoint strings, assigning dense ids in first-seen order.
 struct Dict {
     slots: Vec<(u64, u32)>, // (hash, id + 1); 0 = empty
-    names: Vec<&'static [u8]>,
+    names: Vec<Vec<u8>>,
 }
 
 impl Dict {
@@ -73,7 +75,7 @@ impl Dict {
     }
 
     #[inline(always)]
-    fn id(&mut self, name: &'static [u8]) -> u32 {
+    fn id(&mut self, name: &[u8]) -> u32 {
         if self.names.len() * 2 > self.slots.len() {
             self.grow();
         }
@@ -84,7 +86,7 @@ impl Dict {
             match self.slots[i] {
                 (0, 0) => {
                     self.slots[i] = (h, self.names.len() as u32 + 1);
-                    self.names.push(name);
+                    self.names.push(name.to_vec());
                     return self.names.len() as u32 - 1;
                 }
                 (sh, sid) if sh == h => return sid - 1,
@@ -138,9 +140,10 @@ fn digit(b: u8) -> usize {
     usize::from(b - b'0')
 }
 
-fn read_chunk(d: &'static [u8], mut at: usize, end: usize) -> Chunk {
-    let mut c = Chunk { recs: Vec::with_capacity((end - at) / 70 + 16), dict: Dict::new() };
-    while at < end {
+/// Reduces the whole lines in `d` to records.
+fn read_lines(d: &[u8], c: &mut Chunk) {
+    let mut at = 0;
+    while at < d.len() {
         // "YYYY-MM-DDTHH:MM:SS.ffffffZ " is 28 bytes; the hour index is counted from 2026-10-30T18.
         let day_index = if d[at + 6] == b'0' {
             digit(d[at + 9])
@@ -169,7 +172,27 @@ fn read_chunk(d: &'static [u8], mut at: usize, end: usize) -> Chunk {
         let endpoint = c.dict.id(name);
         c.recs.push(Rec { meta: endpoint | u32::from(hour) << 24 | u32::from(server_error) << 31, latency });
     }
-    c
+}
+
+/// Reads bytes `start..end` (which begin and end on line boundaries) in blocks and reduces them.
+fn read_chunk(f: &File, start: u64, end: u64) -> Chunk {
+    let mut c = Chunk { recs: Vec::with_capacity((end - start) as usize / 70 + 16), dict: Dict::new() };
+    let mut buf = vec![0u8; BLOCK];
+    let (mut off, mut filled) = (start, 0);
+    loop {
+        let n = ((end - off) as usize).min(BLOCK - filled);
+        f.read_exact_at(&mut buf[filled..filled + n], off).expect("read input");
+        off += n as u64;
+        filled += n;
+        // Only whole lines are reduced; the partial last line moves to the front of the buffer.
+        let upto = if off == end { filled } else { buf[..filled].iter().rposition(|&b| b == b'\n').expect("line longer than a block") + 1 };
+        read_lines(&buf[..upto], &mut c);
+        buf.copy_within(upto..filled, 0);
+        filled -= upto;
+        if off == end {
+            return c;
+        }
+    }
 }
 
 fn push_int(out: &mut Vec<u8>, mut v: u64) {
@@ -202,26 +225,27 @@ fn hour_labels() -> Vec<String> {
 }
 
 fn main() {
-    let Some(d) = map("/data/requests.log") else {
+    let f = File::open("/data/requests.log").expect("open input");
+    let len = f.metadata().expect("input size").len();
+    if len == 0 {
         File::create("/out/summary.txt").expect("create output");
         return;
-    };
+    }
     let threads = thread::available_parallelism().map_or(1, |t| t.get()).clamp(1, 12);
 
-    let mut cut = vec![0usize; threads + 1];
-    cut[threads] = d.len();
+    let mut cut = vec![0u64; threads + 1];
+    cut[threads] = len;
     for i in 1..threads {
-        let guess = (d.len() * i / threads).max(cut[i - 1]);
-        cut[i] = d[guess..].iter().position(|&c| c == b'\n').map_or(d.len(), |k| guess + k + 1);
+        cut[i] = line_start(&f, (len * i as u64 / threads as u64).max(cut[i - 1]), len);
     }
     let mut chunks: Vec<Chunk> = thread::scope(|sc| {
-        let cut = &cut;
-        let jobs: Vec<_> = (0..threads).map(|i| sc.spawn(move || read_chunk(d, cut[i], cut[i + 1]))).collect();
+        let (cut, f) = (&cut, &f);
+        let jobs: Vec<_> = (0..threads).map(|i| sc.spawn(move || read_chunk(f, cut[i], cut[i + 1]))).collect();
         jobs.into_iter().map(|j| j.join().unwrap()).collect()
     });
 
     // One global, byte-ordered endpoint list; its index is the endpoint's rank within an hour.
-    let mut endpoints: Vec<&[u8]> = chunks.iter().flat_map(|c| c.dict.names.iter().copied()).collect();
+    let mut endpoints: Vec<Vec<u8>> = chunks.iter().flat_map(|c| c.dict.names.iter().cloned()).collect();
     endpoints.sort_unstable();
     endpoints.dedup();
     let width = endpoints.len();
