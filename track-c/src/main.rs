@@ -148,9 +148,10 @@ fn field(d: &[u8], at: usize, scratch: &mut Vec<u8>, want_hash: bool) -> Option<
 }
 
 fn parse_chunk(d: &[u8], mut at: usize, end: usize, j: &Join) -> Part {
-    // Records average ~60 bytes; reserve each shard's expected share up front (untouched pages cost no memory).
-    let per_shard = (end - at) / 50 / j.shards;
-    let mut part = Part { totals: vec![Totals::NONE; j.countries], keys: (0..j.shards).map(|_| Vec::with_capacity(per_shard)).collect(), end: 0, ok: true };
+    // A shard's keys are sorted and deduplicated whenever they reach `limit`, so the same few names are never stored
+    // millions of times; the limit doubles if a pass frees less than a quarter of the space.
+    let mut limit = vec![1usize << 14; j.shards];
+    let mut part = Part { totals: vec![Totals::NONE; j.countries], keys: (0..j.shards).map(|_| Vec::with_capacity(1 << 14)).collect(), end: 0, ok: true };
     let mut scratch = Vec::new();
     let country_mask = (1u64 << j.country_bits) - 1;
     let mut released = at;
@@ -207,7 +208,20 @@ fn parse_chunk(d: &[u8], mut at: usize, end: usize, j: &Join) -> Part {
         t.cents_min = t.cents_min.min(cents);
         t.cents_max = t.cents_max.max(cents);
         let key = (name_hash & !country_mask) | country as u64;
-        part.keys[((key >> j.country_bits) % j.shards as u64) as usize].push(key);
+        let shard = ((key >> j.country_bits) % j.shards as u64) as usize;
+        let keys = &mut part.keys[shard];
+        keys.push(key);
+        if keys.len() == limit[shard] {
+            keys.sort_unstable();
+            keys.dedup();
+            if keys.len() > limit[shard] / 4 * 3 {
+                limit[shard] *= 2;
+            }
+        }
+    }
+    for keys in &mut part.keys {
+        keys.sort_unstable();
+        keys.dedup();
     }
     part.end = at;
     part
