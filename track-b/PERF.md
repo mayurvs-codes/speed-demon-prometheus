@@ -19,6 +19,7 @@ Every step from the reference to the final version, each with the live-board run
 | 10 | Check a phrase only in documents that hold all its terms | run-f4f6d4549d46 | 0.313 | 307 | 58.43 |
 | 11 | Match phrases while scanning, anchored on their rarest term; no per-token array, and terms used by no BOOL query keep no postings | run-24a01816d67c | 0.326 | 233 | 59.32 |
 | 12 | Each scan thread groups its own postings by term (no separate posting phase, no global posting array) | run-83109bd12e4b | 0.329 | 208 | 59.78 |
+| 13 | Remove the `madvise` page release (step 5): the board's M does not count mapped file pages | run-TBD | | | |
 
 ## Why each change helped
 
