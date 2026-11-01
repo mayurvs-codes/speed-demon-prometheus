@@ -568,8 +568,5 @@ fn run<T: Tag>(vocab: &Vocab, queries: &[Query]) {
     for (qi, line) in answered.iter().flatten() {
         lines[*qi] = line;
     }
-    let mut f = File::create("/out/results.txt").expect("create output");
-    for l in lines {
-        f.write_all(l).expect("write output");
-    }
+    File::create("/out/results.txt").expect("create output").write_all(&lines.concat()).expect("write output");
 }
