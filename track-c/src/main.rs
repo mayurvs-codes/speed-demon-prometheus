@@ -255,18 +255,22 @@ fn main() {
         std::process::exit(1)
     };
 
-    // regions.csv: a header line, then "region_id,CCC" lines. A country code is three letters A-Z, so its base-26 number
-    // indexes a table of 26^3 entries directly, and walking that table in order gives the codes already sorted.
-    let mut region_rows: Vec<(usize, usize)> = Vec::new(); // (region id, code number)
+    // regions.csv: a header line, then "region_id,CCC" lines.
     let mut present = vec![false; 26 * 26 * 26];
-    let mut at = regions.iter().position(|&c| c == b'\n').expect("regions header") + 1;
+    let header_end = regions.iter().position(|&c| c == b'\n').expect("regions header") + 1;
+    let mut at = header_end;
+    let mut max_id = 0usize;
     while at < regions.len() {
-        let comma = at + regions[at..].iter().position(|&c| c == b',').expect("comma");
-        let id = regions[at..comma].iter().fold(0usize, |a, &c| a * 10 + usize::from(c - b'0'));
-        let code = regions[comma + 1..comma + 4].iter().fold(0usize, |a, &c| a * 26 + usize::from(c - b'A'));
+        let mut id = 0usize;
+        while regions[at] != b',' {
+            id = id * 10 + usize::from(regions[at] - b'0');
+            at += 1;
+        }
+        at += 1;
+        let code = usize::from(regions[at] - b'A') * 676 + usize::from(regions[at + 1] - b'A') * 26 + usize::from(regions[at + 2] - b'A');
         present[code] = true;
-        region_rows.push((id, code));
-        at = comma + 5; // "CCC\n"
+        max_id = id;
+        at += 4;
     }
     // Country keys in byte order. "_UNMATCHED" sorts after every three-letter code.
     let mut keys: Vec<Vec<u8>> = Vec::new();
@@ -277,10 +281,18 @@ fn main() {
     }
     keys.push(b"_UNMATCHED".to_vec());
     let unmatched = (keys.len() - 1) as u16;
-    let table_len = region_rows.iter().map(|r| r.0).max().map_or(0, |m| m + 1);
-    let mut country_of_region = vec![unmatched; table_len];
-    for &(id, code) in &region_rows {
+    let mut country_of_region = vec![unmatched; max_id + 1];
+    at = header_end;
+    while at < regions.len() {
+        let mut id = 0usize;
+        while regions[at] != b',' {
+            id = id * 10 + usize::from(regions[at] - b'0');
+            at += 1;
+        }
+        at += 1;
+        let code = usize::from(regions[at] - b'A') * 676 + usize::from(regions[at + 1] - b'A') * 26 + usize::from(regions[at + 2] - b'A');
         country_of_region[id] = index_of_code[code];
+        at += 4;
     }
     let country_bits = usize::BITS - (keys.len() - 1).leading_zeros();
 
