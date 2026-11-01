@@ -3,6 +3,7 @@
 // its records, looks the region up in a dense table and folds the record into per-country sums.
 // Distinct names are counted from 64-bit hashes of the unescaped value, split into shards that
 // are deduplicated in parallel.
+use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -90,14 +91,28 @@ fn has_bom(d: &[u8], at: usize) -> bool {
 
 /// Reads a text field starting at `at`. Returns the index of the byte after it (the comma), the
 /// length of its unescaped value and, if asked, that value's hash.
+/// Index of the first `needle` byte at or after `from`, looking at 32 bytes at a time.
+fn find(d: &[u8], from: usize, needle: u8) -> Option<usize> {
+    let mut i = from;
+    while i + 32 <= d.len() {
+        let hits = unsafe { _mm256_cmpeq_epi8(_mm256_loadu_si256(d.as_ptr().add(i) as *const __m256i), _mm256_set1_epi8(needle as i8)) };
+        let m = unsafe { _mm256_movemask_epi8(hits) } as u32;
+        if m != 0 {
+            return Some(i + m.trailing_zeros() as usize);
+        }
+        i += 32;
+    }
+    d[i..].iter().position(|&c| c == needle).map(|p| i + p)
+}
+
 fn field(d: &[u8], at: usize, scratch: &mut Vec<u8>, want_hash: bool) -> Option<(usize, u64, u64)> {
     if d[at] != b'"' {
-        let len = d[at..].iter().position(|&c| c == b',')?;
+        let len = find(d, at, b',')? - at;
         let h = if want_hash { hash64(&d[at..at + len]) } else { 0 };
         return Some((at + len, len as u64, h));
     }
     let body = at + 1;
-    let mut close = body + d[body..].iter().position(|&c| c == b'"')?;
+    let mut close = find(d, body, b'"')?;
     if d.get(close + 1) != Some(&b'"') {
         // No escaped quote: the value is the bytes between the quotes.
         let h = if want_hash { hash64(&d[body..close]) } else { 0 };
@@ -110,7 +125,7 @@ fn field(d: &[u8], at: usize, scratch: &mut Vec<u8>, want_hash: bool) -> Option<
         if d.get(close + 1) == Some(&b'"') {
             scratch.push(b'"');
             from = close + 2;
-            close = from + d[from..].iter().position(|&c| c == b'"')?;
+            close = find(d, from, b'"')?;
         } else {
             let h = if want_hash { hash64(scratch) } else { 0 };
             return Some((close + 1, scratch.len() as u64, h));
