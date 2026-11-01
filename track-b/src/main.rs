@@ -1,7 +1,7 @@
 // Track B: Index.
 // All 50,000 queries are known up front, so only the terms they mention are indexed.
 //  1. Read the queries and give every distinct term an id.
-//  2. Scan docs.txt in parallel (each thread reads its range in blocks): tokenize, look each token up, record (term, doc) pairs and, for
+//  2. Scan docs.txt in parallel: tokenize, look each token up, record (term, doc) pairs and, for
 //     terms used in phrases, the token-id sequence of every document.
 //  3. Counting-sort the pairs into per-term posting lists; frequent terms also get a bitmap.
 //  4. BOOL queries run left to right on a document bitmap. PHRASE queries walk the rarest term's
@@ -10,31 +10,25 @@ use std::arch::x86_64::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
-use std::os::unix::fs::FileExt;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
-/// Bytes read per call; each scanning thread keeps one buffer of this size.
-const BLOCK: usize = 1 << 20;
-
-/// The whole file, read at once (used for the small query file only).
-fn read_all(path: &str) -> Option<Vec<u8>> {
-    std::fs::read(path).ok().filter(|v| !v.is_empty())
+extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
-/// Start of the first line that begins after `guess` (the end of the file if there is none).
-fn line_start(f: &File, guess: u64, len: u64) -> u64 {
-    let mut buf = [0u8; 4096];
-    let mut at = guess;
-    while at < len {
-        let n = ((len - at) as usize).min(buf.len());
-        f.read_exact_at(&mut buf[..n], at).expect("read input");
-        if let Some(k) = buf[..n].iter().position(|&c| c == b'\n') {
-            return at + k as u64 + 1;
-        }
-        at += n as u64;
+/// Maps a file read-only into memory (std has no mmap, so this declares the libc call).
+fn map(path: &str) -> Option<&'static [u8]> {
+    let f = File::open(path).ok()?;
+    let len = f.metadata().ok()?.len() as usize;
+    if len == 0 {
+        return None;
     }
-    len
+    // PROT_READ, MAP_PRIVATE
+    let p = unsafe { mmap(std::ptr::null_mut(), len, 1, 0x2, f.as_raw_fd(), 0) };
+    (p as isize != -1).then(|| unsafe { std::slice::from_raw_parts(p, len) })
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -186,36 +180,21 @@ unsafe fn token_key(d: &[u8], at: usize, len: usize) -> (u64, u64) {
 /// Scans the documents in d[at..end]. A term with a bitmap row (`rows[t] >= 0`) sets its bit directly; a term with no row
 /// records one (term, document) pair; a term that no BOOL query uses (`rows[t] == -2`) needs neither. Phrases are matched
 /// as each document ends.
-fn scan(f: &File, start: u64, end: u64, vocab: &Vocab, rows: &[i32], bitmaps: &[AtomicU64], words: usize, ph: &Phrases) -> Slice {
+fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmaps: &[AtomicU64], words: usize, ph: &Phrases) -> Slice {
     let mut s = Slice { phrases: (0..ph.terms.len()).map(|_| Answer::default()).collect(), ..Default::default() };
     // Everything the scan keeps per term sits together, so a token costs one cache miss here.
     let mut state: Vec<TermState> = rows.iter().map(|&row| TermState { last_doc: 0, row, pairs: 0 }).collect();
     let mut last_match = vec![0u32; ph.terms.len()]; // doc + 1 of the last match per phrase
     let mut ids: Vec<u32> = Vec::new(); // the current document's term ids (u32::MAX for a token no query uses)
-    let mut buf = vec![0u8; BLOCK];
-    let (mut off, mut filled) = (start, 0usize);
-    loop {
-        let n = ((end - off) as usize).min(BLOCK - filled);
-        f.read_exact_at(&mut buf[filled..filled + n], off).expect("read input");
-        off += n as u64;
-        filled += n;
-        // Only whole documents are scanned; the partial last line moves to the front of the buffer.
-        let upto = if off == end { filled } else { buf[..filled].iter().rposition(|&b| b == b'\n').expect("document longer than a block") + 1 };
-        scan_documents(&buf[..upto], &mut s, &mut state, &mut last_match, &mut ids, vocab, bitmaps, words, ph);
-        buf.copy_within(upto..filled, 0);
-        filled -= upto;
-        if off == end {
-            break;
+    let mut released = at;
+    while at < end {
+        // Behind us the pages are finished with: hand whole pages back (MADV_DONTNEED drops only this process's
+        // mapping; the file stays in the page cache), so the corpus never sits fully resident.
+        if at - released >= 1 << 20 {
+            let (lo, hi) = ((released + 4095) & !4095, at & !4095);
+            unsafe { madvise(d.as_ptr().add(lo) as *mut u8, hi - lo, 4) };
+            released = at;
         }
-    }
-    s.per_term = state.iter().map(|e| e.pairs).collect();
-    s
-}
-
-/// Scans the whole documents in `d`.
-fn scan_documents(d: &[u8], s: &mut Slice, state: &mut [TermState], last_match: &mut [u32], ids: &mut Vec<u32>, vocab: &Vocab, bitmaps: &[AtomicU64], words: usize, ph: &Phrases) {
-    let mut at = 0;
-    while at < d.len() {
         let mut doc = 0u32;
         while d[at] != b'\t' {
             doc = doc * 10 + u32::from(d[at] - b'0');
@@ -299,6 +278,8 @@ fn scan_documents(d: &[u8], s: &mut Slice, state: &mut [TermState], last_match: 
             }
         }
     }
+    s.per_term = state.iter().map(|e| e.pairs).collect();
+    s
 }
 
 /// The document ids whose bits are set in a bitmap, ascending.
@@ -374,7 +355,7 @@ impl Answer {
 }
 
 fn main() {
-    let Some(query_text) = read_all("/data/queries.txt") else { std::process::exit(1) };
+    let Some(query_text) = map("/data/queries.txt") else { std::process::exit(1) };
 
     // 1. Queries and vocabulary.
     let mut vocab = Vocab { words: Vec::new(), slots: Vec::new(), bits: 0, long: HashMap::new() };
@@ -417,34 +398,28 @@ fn run(vocab: &mut Vocab, queries: &mut [Query]) {
     // 2. Choose the frequent terms. A short sample of each thread's slice estimates document frequencies. A term
     //    in at least 2 bitmap-words' worth of documents gets a bitmap row that the scan fills directly, so it needs
     //    no (term, document) pairs and no posting list.
-    let docs = File::open("/data/docs.txt").expect("open docs");
-    let len = docs.metadata().expect("docs size").len();
+    let docs = map("/data/docs.txt").unwrap_or(&[]);
     let threads = thread::available_parallelism().map_or(1, |t| t.get()).clamp(1, 12);
-    let mut cut = vec![0u64; threads + 1];
-    cut[threads] = len;
+    let mut cut = vec![0usize; threads + 1];
+    cut[threads] = docs.len();
     for i in 1..threads {
-        cut[i] = line_start(&docs, (len * i as u64 / threads as u64).max(cut[i - 1]), len);
+        let guess = (docs.len() * i / threads).max(cut[i - 1]);
+        cut[i] = docs[guess..].iter().position(|&c| c == b'\n').map_or(docs.len(), |k| guess + k + 1);
     }
     // Document ids are dense, so the id on the last line gives the document count.
-    let n_docs = if len == 0 {
-        0
-    } else {
-        let mut tail = vec![0u8; len.min(1 << 16) as usize];
-        let from = len - tail.len() as u64;
-        docs.read_exact_at(&mut tail, from).expect("read input");
-        let last_line = tail[..tail.len() - 1].iter().rposition(|&c| c == b'\n').map_or(0, |p| p + 1);
-        tail[last_line..].iter().take_while(|c| c.is_ascii_digit()).fold(0, |a, &c| a * 10 + usize::from(c - b'0')) + 1
-    };
+    let last_line = docs[..docs.len().saturating_sub(1)].iter().rposition(|&c| c == b'\n').map_or(0, |p| p + 1);
+    let n_docs = if docs.is_empty() { 0 } else { docs[last_line..].iter().take_while(|c| c.is_ascii_digit()).fold(0, |a, &c| a * 10 + usize::from(c - b'0')) + 1 };
     let words_per_bitmap = n_docs.div_ceil(64);
     let no_rows = vec![-1i32; n_terms];
     let no_phrases = Phrases { terms: Vec::new(), anchored: vec![0; n_terms.div_ceil(64)], at: Vec::new() };
     let sample: Vec<Slice> = thread::scope(|sc| {
-        let (vocab, cut, no_rows, no_phrases, docs) = (&vocab, &cut, &no_rows, &no_phrases, &docs);
+        let (vocab, cut, no_rows, no_phrases) = (&vocab, &cut, &no_rows, &no_phrases);
         let jobs: Vec<_> = (0..threads)
             .map(|i| {
                 sc.spawn(move || {
                     let (b, e) = (cut[i], cut[i + 1]);
-                    let stop = line_start(docs, b + (e - b) / 32, len).min(e);
+                    let mid = b + (e - b) / 32;
+                    let stop = docs[mid..e].iter().position(|&c| c == b'\n').map_or(e, |k| mid + k + 1);
                     scan(docs, b, stop, vocab, no_rows, &[], 0, no_phrases)
                 })
             })
@@ -503,7 +478,7 @@ fn run(vocab: &mut Vocab, queries: &mut [Query]) {
     // 3. Scan the documents.
     let bitmaps: Vec<AtomicU64> = (0..n_dense as usize * words_per_bitmap).map(|_| AtomicU64::new(0)).collect();
     let slices: Vec<Slice> = thread::scope(|sc| {
-        let (vocab, cut, rows, bitmaps, ph, docs) = (&vocab, &cut, &rows, &bitmaps, &ph, &docs);
+        let (vocab, cut, rows, bitmaps, ph) = (&vocab, &cut, &rows, &bitmaps, &ph);
         let jobs: Vec<_> = (0..threads).map(|i| sc.spawn(move || {
             let mut s = scan(docs, cut[i], cut[i + 1], vocab, rows, bitmaps, words_per_bitmap, ph);
             group(&mut s);
