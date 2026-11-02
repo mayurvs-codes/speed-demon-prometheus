@@ -55,3 +55,15 @@ Each thread reads its byte range with `read_exact_at` into one 512 KB buffer, pa
 ## Memory as the scorer counts it (cgroup `memory.peak`)
 
 The RSS figures above come from `/usr/bin/time`. The scorer reads the container's kernel peak counter instead, so it was re-measured in the board's sandbox shape (Docker Desktop VM, full-scale seed 1, three runs per build): **307.8 MB** with the `madvise` step and **307.7 MB** with the call turned into a no-op. The two agree within run-to-run noise, so handing pages back lowers RSS (about 297 MB to 151 MB) but **does not lower `memory.peak`**: the file pages stay in the page cache, which the cgroup still charges. Treat the memory gain of the `madvise` step as unproven; the board's M column is the authority. This is a local re-measurement, not a board number.
+
+## Board-measured steps on Nov 2
+
+| Step | Change | Commit | Run ID | T (s) | M (MB) | Points |
+|---|---|---|---|---|---|---|
+| before | Block reads, 8-byte record per line, counting sort into one 12 MB latency array | `9641f29` | `run-2f31a277cee0` | 0.0524 | 57.0 | 69.34 |
+| 5 | Each thread appends a line's latency (4 bytes) and endpoint id with the 5xx flag (2 bytes) to its own list for that line's hour. Per hour, a small counting sort groups the lines by endpoint inside the cache. The record array, the global latency array and the three sort passes over them are gone. | `d6d03e9` | `run-cd060a1e384b` | 0.0626 | 58.5 | 67.84 |
+| 6 | Threads take hours in order and append each finished hour to the file, instead of holding all 10 MB of output until the end. Local peak RSS 46 to 40 MB. | `b6e330e` (measured in `950c34b`) | `run-13f24991ac35` | 0.0545 | 52.1 | 69.80 |
+| 7 | Endpoint merge: the threads' (hash, thread, id) triples are sorted by hash and only one name per hash is sorted as bytes, instead of cloning and sorting all ~22,000 per-thread names and then binary-searching each one. This was 7 ms on one thread, about 12% of the local run. | `8ce3c8e` (measured in `891d446`) | `run-99e8a7acc5ec` | 0.0446 | 51.2 | 71.91 |
+| 7, re-run | Same code | `6926e1d` | `run-43009029e2ae` | 0.0449 | 51.4 | 71.81 |
+
+Step 5 did not lower M as expected: the latency lists (19 MB) and read buffers (6 MB) remain, and the 10 MB output was still buffered. Step 6 dealt with the output. Where the rest of the time goes now (local, data in a Docker volume, output in memory): reading the file alone takes 15-23 ms, parsing adds about 20 ms, and the per-hour phase is about 5 ms of work per thread plus serialized writes of the 10 MB output.
