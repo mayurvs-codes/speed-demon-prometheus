@@ -63,3 +63,5 @@ The RSS figures above come from `/usr/bin/time`. The scorer reads the container'
 | 9, re-runs | Same code | `891d446`, `6926e1d` | `run-77109c342e8c`, `run-289269c5723a` | 0.1080, 0.0667 | 13.3, 14.0 | 62.50, 67.52 |
 
 The 0.108 s run is an outlier: 15 local runs of the same build span 53-79 ms with no slow tail. Step 8 shows that releasing mapped pages more often does lower the board's M (it is not only the page cache), which corrects the note above. Still slower than the sort version: about 1.8M of the 3.3M (name, country) pairs are new, and each new bit is an atomic write to a cache line another core probably wrote last. A version with 4-byte keys sharded by name id, with non-atomic bits per shard, was tried locally: no faster, and 35 MB. Not pushed.
+
+Also tried on the board and reverted: prefetching the name-table slot two records ahead (`6d263ad`, `run-de3072eff3e5`: 0.0790 s, 65.93 points), and prefetching the region's country with each record folded one record late (`694e15c`, `run-0eb57bc4db7d`: 0.0674 s, 67.42 points, the same as without it).

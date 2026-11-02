@@ -263,9 +263,6 @@ fn parse_chunk(d: &[u8], mut at: usize, end: usize, j: &Join) -> Part {
     let mut part = Part { totals: vec![Totals::NONE; j.countries], end: 0, ok: true };
     let mut scratch = Vec::new();
     let mut pipeline = Pipeline::default();
-    // The region's country is a random read in a 2 MB table, so a record is folded in one record after it is parsed,
-    // with its table entry prefetched: (region, id, name length, note length, cents, name hash).
-    let mut parsed: Option<(usize, u64, u64, u64, i64, u64)> = None;
     let mut released = at;
     while at < end {
         // Behind us the pages are finished with: hand whole pages back (MADV_DONTNEED drops only this process's
@@ -310,34 +307,21 @@ fn parse_chunk(d: &[u8], mut at: usize, end: usize, j: &Join) -> Part {
             at += if d[at] == b'\r' { 2 } else { 1 };
         }
 
-        if let Some(&c) = j.country_of_region.get(region) {
-            unsafe { _mm_prefetch(&c as *const u16 as *const i8, _MM_HINT_T0) };
-        }
-        if let Some(r) = parsed.replace((region, id, name_len, note_len, cents, name_hash)) {
-            fold(j, &mut part, &mut pipeline, r);
-        }
-    }
-    if let Some(r) = parsed {
-        fold(j, &mut part, &mut pipeline, r);
+        let country = usize::from(*j.country_of_region.get(region).unwrap_or(&j.unmatched));
+        let t = &mut part.totals[country];
+        t.count += 1;
+        t.id_sum += id;
+        t.name_bytes += name_len;
+        t.note_bytes += note_len;
+        t.cents_sum += cents;
+        t.cents_min = t.cents_min.min(cents);
+        t.cents_max = t.cents_max.max(cents);
+        pipeline.push(j.names, Some((name_hash, country)));
     }
     pipeline.push(j.names, None);
     pipeline.push(j.names, None);
     part.end = at;
     part
-}
-
-/// Adds one parsed record to its country's totals and sends its name down the pipeline.
-fn fold(j: &Join, part: &mut Part, pipeline: &mut Pipeline, (region, id, name_len, note_len, cents, name_hash): (usize, u64, u64, u64, i64, u64)) {
-    let country = usize::from(*j.country_of_region.get(region).unwrap_or(&j.unmatched));
-    let t = &mut part.totals[country];
-    t.count += 1;
-    t.id_sum += id;
-    t.name_bytes += name_len;
-    t.note_bytes += note_len;
-    t.cents_sum += cents;
-    t.cents_min = t.cents_min.min(cents);
-    t.cents_max = t.cents_max.max(cents);
-    pipeline.push(j.names, Some((name_hash, country)));
 }
 
 /// First record start at or after `from`: just after an LF (and optional BOM) when a digit follows.
