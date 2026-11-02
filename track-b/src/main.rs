@@ -289,9 +289,9 @@ fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmap
                 vocab.find(lo, hi, home).unwrap_or(u32::MAX)
             }
         }));
-        // Record the document's terms, with the state entry a few tokens ahead already on its way from memory.
+        // Record the document's terms, with the state entry 16 tokens ahead already on its way from memory.
         for (i, &t) in ids.iter().enumerate() {
-            if let Some(&next) = ids.get(i + 8) {
+            if let Some(&next) = ids.get(i + 16) {
                 unsafe { _mm_prefetch(state.as_ptr().wrapping_add(next as usize) as *const i8, _MM_HINT_T0) };
             }
             if t == u32::MAX {
