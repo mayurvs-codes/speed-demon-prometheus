@@ -2,21 +2,21 @@
 
 Every step from the reference to the final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way the log says it did.
 
-**Board result, all tuning steps combined (commit `bbb8ff3`): run `run-abca22fa67d2`.** T = 0.065 s, M = 76 MB, K = 20.6, 65.7 points; every gate passed. The Run ID, T and M columns in the step table below are still TODO: the steps were tuned locally and have not each been measured on the board yet, so they are left blank rather than guessed. The "Local measurements" section is from one laptop and is only for comparing changes against each other.
+**Board result, all tuning steps combined (commit `bbb8ff3`): run `run-abca22fa67d2`.** T = 0.065 s, M = 76 MB, K = 20.6, 65.7 points; every gate passed. Rows marked "not measured on its own" were tuned locally and never run on the board one at a time; the combined run above and the later board sections cover them, so their cells stay blank rather than guessed. The "Local measurements" section is from one laptop and is only for comparing changes against each other.
 
 **Latest board run (code of commit `8f492c2`): `run-bf3e42893655`.** T = 0.0562 s, M = 68.9 MB, S = 360, K = 22.94, 68.03 points; every gate passed. Board noise on identical Track A code is about 5% in T (0.0562 to 0.0615 s over four runs of this code).
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
-| 1 | Map the log without `MAP_POPULATE` | TODO | TODO | TODO | |
-| 2 | Hand finished log pages back with `madvise(MADV_DONTNEED)` every 4 MB | TODO | TODO | TODO | |
-| 3 | Parallel counting sort of the latencies | TODO | TODO | TODO | |
-| 4 | Find the end of each endpoint name 32 bytes at a time (AVX2) | TODO | TODO | TODO | |
+| 1 | Map the log without `MAP_POPULATE` | not measured on its own | | | |
+| 2 | Hand finished log pages back with `madvise(MADV_DONTNEED)` every 4 MB | not measured on its own | | | |
+| 3 | Parallel counting sort of the latencies | not measured on its own | | | |
+| 4 | Find the end of each endpoint name 32 bytes at a time (AVX2) | not measured on its own | | | |
 | 5 | Tell endpoint names apart by their 64-bit hash alone (no `memcmp`, no `memcpy` in the hash) | run-b237de1bd35f | 0.0593 | 77.7 | 66.84 |
 | 6 | 8-byte records: the endpoint id, hour and 5xx flag share one `u32` | run-b10da1d9fb74 | 0.0579 | 66.3 | 67.82 |
 | 7 | Remove the `madvise` page release (step 2): the board's M does not count mapped file pages | run-4ee67ae87f66 | 0.0573 | 65.8 | 68.03 |
-| 8 | Compact u32 bucket counters, AtomicU32 error counters, early drop of chunks/pos before formatting, fast hour parsing | TODO | TODO | TODO | |
+| 8 | Compact u32 bucket counters, AtomicU32 error counters, early drop of chunks/pos before formatting, fast hour parsing | not measured on its own | | | |
 | tried | Threads claim 96 pieces of the file from a shared counter instead of one fixed range each (in case some cores run slower). No faster, and 4 MB more memory, so reverted. | `f5395c3` | `run-0d86a81f3223` | 0.0436 | 54.5 | 71.77 |
 
 ## Why each change helped

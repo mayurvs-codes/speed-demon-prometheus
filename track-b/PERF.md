@@ -2,21 +2,21 @@
 
 Every step from the reference to the final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way the log says it did.
 
-**Board result, all tuning steps combined (commit `bbb8ff3`): run `run-6e0521f9cea3`.** T = 0.411 s, M = 290 MB, K = 12.9, 55.5 points; every gate passed. The Run ID, T and M columns in the step table below are still TODO: the steps were tuned locally and have not each been measured on the board yet, so they are left blank rather than guessed. The "Local measurements" section is from one laptop and is only for comparing changes against each other.
+**Board result, all tuning steps combined (commit `bbb8ff3`): run `run-6e0521f9cea3`.** T = 0.411 s, M = 290 MB, K = 12.9, 55.5 points; every gate passed. Rows marked "not measured on its own" were tuned locally and never run on the board one at a time; the combined run above and the later board sections cover them, so their cells stay blank rather than guessed. The "Local measurements" section is from one laptop and is only for comparing changes against each other.
 
 **Latest board run (code of commit `8f492c2`): `run-68b6c247ebcc`.** T = 0.313 s, M = 212 MB, S = 629, K = 16.04, 60.25 points; every gate passed. Board noise on identical Track B code: T 0.313 to 0.346 s, M 177 to 212 MB over eight runs.
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 56.35 | 2200 | 0 |
-| 1 | Terms of up to 16 bytes live inline in a compact table (no hash pass, no `memcmp`, no pointer chase) | TODO | TODO | TODO | |
-| 2 | AVX2 tokenizer | TODO | TODO | TODO | |
-| 3 | Map the corpus without `MAP_POPULATE` | TODO | TODO | TODO | |
-| 4 | Very common terms fill a bitmap directly (no pairs, no posting lists) | TODO | TODO | TODO | |
-| 5 | Hand finished corpus pages back with `madvise(MADV_DONTNEED)` every 4 MB | TODO | TODO | TODO | |
-| 6 | Count and sum BOOL results per 64-bit word with popcounts | TODO | TODO | TODO | |
-| 7 | Phrase tags as `u16` ranks (generic, falls back to `u32`) | TODO | TODO | TODO | |
-| 8 | Stop a BOOL query early when its result is empty and no OR remains | TODO | TODO | TODO | |
+| 1 | Terms of up to 16 bytes live inline in a compact table (no hash pass, no `memcmp`, no pointer chase) | not measured on its own | | | |
+| 2 | AVX2 tokenizer | not measured on its own | | | |
+| 3 | Map the corpus without `MAP_POPULATE` | not measured on its own | | | |
+| 4 | Very common terms fill a bitmap directly (no pairs, no posting lists) | not measured on its own | | | |
+| 5 | Hand finished corpus pages back with `madvise(MADV_DONTNEED)` every 4 MB | not measured on its own | | | |
+| 6 | Count and sum BOOL results per 64-bit word with popcounts | not measured on its own | | | |
+| 7 | Phrase tags as `u16` ranks (generic, falls back to `u32`) | not measured on its own | | | |
+| 8 | Stop a BOOL query early when its result is empty and no OR remains | not measured on its own | | | |
 | 9 | Write all result lines with one `write` | run-5be09f50b1ae | 0.334 | 309 | 57.74 |
 | 10 | Check a phrase only in documents that hold all its terms | run-f4f6d4549d46 | 0.313 | 307 | 58.43 |
 | 11 | Match phrases while scanning, anchored on their rarest term; no per-token array, and terms used by no BOOL query keep no postings | run-24a01816d67c | 0.326 | 233 | 59.32 |

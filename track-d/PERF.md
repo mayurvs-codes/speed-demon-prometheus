@@ -2,18 +2,18 @@
 
 Every step from the reference to the final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way the log says it did.
 
-**Board result, all tuning steps combined (commit `bbb8ff3`): run `run-fb6f9ba5cfc5`.** T = 0.507 s, M = 309 MB, K = 11.1, 52.2 points; every gate passed. The Run ID, T and M columns in the step table below are still TODO: the steps were tuned locally and have not each been measured on the board yet, so they are left blank rather than guessed. The "Local measurements" section is from one laptop and is only for comparing changes against each other.
+**Board result, all tuning steps combined (commit `bbb8ff3`): run `run-fb6f9ba5cfc5`.** T = 0.507 s, M = 309 MB, K = 11.1, 52.2 points; every gate passed. Rows marked "not measured on its own" were tuned locally and never run on the board one at a time; the combined run above and the later board sections cover them, so their cells stay blank rather than guessed. The "Local measurements" section is from one laptop and is only for comparing changes against each other.
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 72.69 | 893 | 0 |
-| 1 | Renumber the nodes in breadth-first order and rebuild the arc array in that order | TODO | TODO | TODO | |
-| 2 | Track the BFS's visited nodes in a bitset instead of the 7 MB id array | TODO | TODO | TODO | |
-| 3 | Prefetch the next nodes' offsets and arcs in the BFS loop | TODO | TODO | TODO | |
-| 4 | Hand finished graph pages back with `madvise` and drop `MAP_POPULATE` | TODO | TODO | TODO | |
-| 5 | Pack the per-node search label to 12 bytes | TODO | TODO | TODO | |
-| 6 | One packed 128-bit key per heap entry | TODO | TODO | TODO | |
-| 7 | 8-byte distance array with per-query touched list reset | TODO | TODO | TODO | |
+| 1 | Renumber the nodes in breadth-first order and rebuild the arc array in that order | not measured on its own | | | |
+| 2 | Track the BFS's visited nodes in a bitset instead of the 7 MB id array | not measured on its own | | | |
+| 3 | Prefetch the next nodes' offsets and arcs in the BFS loop | not measured on its own | | | |
+| 4 | Hand finished graph pages back with `madvise` and drop `MAP_POPULATE` | not measured on its own | | | |
+| 5 | Pack the per-node search label to 12 bytes | not measured on its own | | | |
+| 6 | One packed 128-bit key per heap entry | not measured on its own | | | |
+| 7 | 8-byte distance array with per-query touched list reset | not measured on its own | | | |
 
 ## Why each change helped
 

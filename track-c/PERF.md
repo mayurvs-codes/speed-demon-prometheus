@@ -2,18 +2,18 @@
 
 Every step from the reference to the final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way the log says it did.
 
-**Board result, all tuning steps combined (commit `bbb8ff3`): run `run-96b55f9e626c`.** T = 0.067 s, M = 60 MB, K = 17.2, 61.8 points; every gate passed. The Run ID, T and M columns in the step table below are still TODO: the steps were tuned locally and have not each been measured on the board yet, so they are left blank rather than guessed. The "Local measurements" section is from one laptop and is only for comparing changes against each other.
+**Board result, all tuning steps combined (commit `bbb8ff3`): run `run-96b55f9e626c`.** T = 0.067 s, M = 60 MB, K = 17.2, 61.8 points; every gate passed. Rows marked "not measured on its own" were tuned locally and never run on the board one at a time; the combined run above and the later board sections cover them, so their cells stay blank rather than guessed. The "Local measurements" section is from one laptop and is only for comparing changes against each other.
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 14.44 | 367 | 0 |
-| 1 | Build the region table without sorting 200,000 codes | TODO | TODO | TODO | |
-| 2 | Map the input without `MAP_POPULATE` | TODO | TODO | TODO | |
-| 3 | Hand finished input pages back with `madvise(MADV_DONTNEED)` every 4 MB | TODO | TODO | TODO | |
-| 4 | Find quotes and commas 32 bytes at a time (AVX2) | TODO | TODO | TODO | |
-| 5 | Reserve each shard's key capacity up front | TODO | TODO | TODO | |
-| 6 | Compute unescaped note length directly without scratch buffer copies | TODO | TODO | TODO | |
-| 7 | Build region table directly without intermediate region_rows vector | TODO | TODO | TODO | |
+| 1 | Build the region table without sorting 200,000 codes | not measured on its own | | | |
+| 2 | Map the input without `MAP_POPULATE` | not measured on its own | | | |
+| 3 | Hand finished input pages back with `madvise(MADV_DONTNEED)` every 4 MB | not measured on its own | | | |
+| 4 | Find quotes and commas 32 bytes at a time (AVX2) | not measured on its own | | | |
+| 5 | Reserve each shard's key capacity up front | not measured on its own | | | |
+| 6 | Compute unescaped note length directly without scratch buffer copies | not measured on its own | | | |
+| 7 | Build region table directly without intermediate region_rows vector | not measured on its own | | | |
 
 ## Why each change helped
 
