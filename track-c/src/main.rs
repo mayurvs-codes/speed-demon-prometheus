@@ -1,8 +1,8 @@
 // Track C: Join.
 // records.csv is mapped and cut into one chunk per thread at record starts. Each thread parses
 // its records, looks the region up in a dense table and folds the record into per-country sums.
-// Distinct names: every thread interns the 64-bit hash of the unescaped name in one shared lock-free table (a
-// name's id is its slot) and sets the bit (name id, country). No per-record key is stored.
+// Distinct names: every thread interns the 64-bit hash of the unescaped name in one shared lock-free table that
+// hands out dense name ids, and sets the bit (name id, country). No per-record key is stored.
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
@@ -69,15 +69,16 @@ impl Totals {
     }
 }
 
-/// Lock-free set of name hashes shared by all threads. A name's id is the index of its slot, so a lookup reads one
-/// 8-byte entry and nothing else, and the whole table (1 MB at 2^17 slots) mostly stays in a core's L2 cache. Once
-/// 7/8 of the slots are taken, `full` is set and the file is parsed again with a bigger table.
+/// Lock-free set of name hashes shared by all threads. A name's id is its order of first insertion, so the
+/// (name, country) bits stay dense. It holds at most half of `slots`, which keeps probes short; a file with more
+/// distinct names sets `full` and is parsed again with a bigger table.
 struct Names {
     slots: Vec<AtomicU64>, // name hash (never 0); 0 = empty
-    used: AtomicU32,
+    ids: Vec<AtomicU32>,   // id + 1 of the name in the same slot; 0 = not yet published
+    next: AtomicU32,
     full: AtomicBool,
     words: usize,         // u64 words of country bits per name
-    seen: Vec<AtomicU64>, // bit (slot, country) is at seen[slot * words + country / 64]
+    seen: Vec<AtomicU64>, // bit (id, country) is at seen[id * words + country / 64]
 }
 
 impl Names {
@@ -85,10 +86,11 @@ impl Names {
         let words = countries.div_ceil(64);
         Names {
             slots: (0..capacity).map(|_| AtomicU64::new(0)).collect(),
-            used: AtomicU32::new(0),
+            ids: (0..capacity).map(|_| AtomicU32::new(0)).collect(),
+            next: AtomicU32::new(0),
             full: AtomicBool::new(false),
             words,
-            seen: (0..capacity * words).map(|_| AtomicU64::new(0)).collect(),
+            seen: (0..capacity / 2 * words).map(|_| AtomicU64::new(0)).collect(),
         }
     }
 
@@ -97,22 +99,37 @@ impl Names {
         let mask = self.slots.len() - 1;
         let mut i = h as usize & mask;
         loop {
-            let mut cur = self.slots[i].load(Ordering::Relaxed);
+            let mut cur = self.slots[i].load(Ordering::Acquire);
             if cur == 0 {
-                if self.used.load(Ordering::Relaxed) as usize >= self.slots.len() / 8 * 7 {
+                if self.next.load(Ordering::Relaxed) as usize >= self.slots.len() / 2 {
                     self.full.store(true, Ordering::Relaxed);
                     return 0;
                 }
-                match self.slots[i].compare_exchange(0, h, Ordering::Relaxed, Ordering::Relaxed) {
+                match self.slots[i].compare_exchange(0, h, Ordering::AcqRel, Ordering::Acquire) {
                     Ok(_) => {
-                        self.used.fetch_add(1, Ordering::Relaxed);
-                        return i;
+                        let id = self.next.fetch_add(1, Ordering::Relaxed);
+                        if id as usize >= self.slots.len() / 2 {
+                            self.full.store(true, Ordering::Relaxed);
+                            return 0;
+                        }
+                        self.ids[i].store(id + 1, Ordering::Release);
+                        return id as usize;
                     }
                     Err(now) => cur = now,
                 }
             }
             if cur == h {
-                return i;
+                // Another thread may have claimed the slot and not yet published its id.
+                loop {
+                    let id = self.ids[i].load(Ordering::Acquire);
+                    if id != 0 {
+                        return id as usize - 1;
+                    }
+                    if self.full.load(Ordering::Relaxed) {
+                        return 0;
+                    }
+                    std::hint::spin_loop();
+                }
             }
             i = (i + 1) & mask;
         }
@@ -123,6 +140,7 @@ impl Names {
         let i = hash.max(1) as usize & (self.slots.len() - 1);
         unsafe {
             _mm_prefetch(self.slots.as_ptr().add(i) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(self.ids.as_ptr().add(i) as *const i8, _MM_HINT_T0);
         }
     }
 
@@ -166,8 +184,7 @@ impl Pipeline {
 
 /// Everything a parsing thread needs to know about the join.
 struct Join<'a> {
-    country_of_region: &'a [u16], // used when there are more than 256 groups
-    country8: &'a [u8],           // otherwise this half-size copy (1 MB at full scale, so it stays in L2)
+    country_of_region: &'a [u16],
     unmatched: u16,
     countries: usize,
     names: &'a Names,
@@ -290,11 +307,7 @@ fn parse_chunk(d: &[u8], mut at: usize, end: usize, j: &Join) -> Part {
             at += if d[at] == b'\r' { 2 } else { 1 };
         }
 
-        let country = if j.country8.is_empty() {
-            usize::from(*j.country_of_region.get(region).unwrap_or(&j.unmatched))
-        } else {
-            usize::from(j.country8.get(region).map_or(j.unmatched, |&c| u16::from(c)))
-        };
+        let country = usize::from(*j.country_of_region.get(region).unwrap_or(&j.unmatched));
         let t = &mut part.totals[country];
         t.count += 1;
         t.id_sum += id;
@@ -398,10 +411,8 @@ fn main() {
     let mut first = if has_bom(records, 0) { 3 } else { 0 };
     first += records[first..].iter().position(|&c| c == b'\n').expect("header") + 1;
 
-    let country8: Vec<u8> = if keys.len() <= 256 { country_of_region.iter().map(|&c| c as u8).collect() } else { Vec::new() };
-    let country_of_region = if country8.is_empty() { country_of_region } else { Vec::new() };
     let parse_with = |parts: usize, names: &Names| -> Option<Vec<Part>> {
-        let join = Join { country_of_region: &country_of_region, country8: &country8, unmatched, countries: keys.len(), names };
+        let join = Join { country_of_region: &country_of_region, unmatched, countries: keys.len(), names };
         let mut cut = vec![first; parts + 1];
         cut[parts] = end;
         for i in 1..parts {
@@ -416,8 +427,8 @@ fn main() {
         let lined_up = done.iter().enumerate().all(|(i, p)| p.ok && p.end == cut[i + 1]);
         lined_up.then_some(done)
     };
-    // Start with 2^17 slots; a file with more than 7/8 that many distinct names is parsed again with 8x the room.
-    let mut capacity = 1 << 17;
+    // Start with 2^18 slots; a file with more than half that many distinct names is parsed again with 8x the room.
+    let mut capacity = 1 << 18;
     let (parts, names) = loop {
         let names = Names::new(capacity, keys.len());
         let parts = match parse_with(threads, &names) {
@@ -441,7 +452,7 @@ fn main() {
 
     // names_distinct per country: the set bits of that country across all name ids.
     let mut distinct = vec![0u64; keys.len()];
-    for row in names.seen.chunks(names.words) {
+    for row in names.seen[..names.next.load(Ordering::Relaxed) as usize * names.words].chunks(names.words) {
         for (w, word) in row.iter().enumerate() {
             let mut bits = word.load(Ordering::Relaxed);
             while bits != 0 {
