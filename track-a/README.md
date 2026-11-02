@@ -6,11 +6,11 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-The log is mapped into memory and cut into one slice per thread (12 threads) at line boundaries. Each thread turns its lines into small records: an endpoint id, an hour number from 0 to 71, the latency and a flag for a 5xx status. The hour comes straight from the fixed-width timestamp (month, day and hour digits at known offsets), so no date parsing is needed. Endpoint names are given small integer ids by a per-thread hash table, so long strings are never compared in the hot loop.
+The log is cut into one byte range per thread (12 threads) at line boundaries, and each thread reads its range with `read_exact_at` into one reused 256 KB buffer (no memory map). For every line it appends the latency (4 bytes) and the endpoint id with the 5xx flag (2 bytes) to its own lists for that line's hour; nothing else per line is kept. The hour comes straight from the fixed-width timestamp (month, day and hour digits at known offsets), so no date parsing is needed. Endpoint names are given small integer ids by a per-thread hash table, so long strings are never compared in the hot loop.
 
-When all threads are done, the endpoint names from all threads are sorted by unsigned bytes into one list; an endpoint's position in that list is its rank. A record's bucket is `hour * (number of endpoints) + rank`, so the bucket order is exactly the output order. A parallel counting sort puts every latency into its bucket: each thread counts its own records per bucket, the counts become start positions (chunk after chunk inside each bucket), and each thread then writes its own latencies into those private ranges.
+When all threads are done, the threads' (name hash, thread, id) triples are grouped by hash and one name per group is sorted by unsigned bytes; an endpoint's position in that list is its rank, so rank order is the output order within an hour.
 
-Inside each bucket the three percentiles are found by selection (`select_nth_unstable`) with the nearest-rank positions `(p * n + 99) / 100`, not by sorting. Each thread formats a run of hours into its own buffer, and the buffers are written in hour order.
+Threads then take hours in order. For one hour, a small counting sort over the twelve threads' lists for that hour groups the latencies by endpoint rank in a buffer that stays in cache. Inside each group the three percentiles are found by selection (`select_nth_unstable`) with the nearest-rank positions `(p * n + 99) / 100`, not by sorting. The hour's lines are formatted and appended to the file as soon as every earlier hour has been written, so at most one hour of output per thread is in memory.
 
 ## Correctness
 
@@ -28,12 +28,12 @@ Full-scale seed-1 output hash: `495ca09682b9673ef836a506496177680bb4a3af54255174
 
 ## Dependencies
 
-None. The memory-map calls (`mmap`, `madvise`) are declared directly with `extern "C"` because the standard library has no memory map.
+None. The input is read with `std::os::unix::fs::FileExt::read_exact_at`.
 
 ## Results
 
-Median 0.120 s to 0.077 s (-36%), peak RSS 297,412 KB to 150,900 KB (-49%) (local laptop numbers; see PERF.md for the per-change log and the board runs once filled in).
+On the board: 0.0435 s, 50 MB, 72.3 points (`run-8d255310178a`, `run-5a4cea4e665c`), from 0.0642 s and 67.65 points with the memory map. Earlier local laptop numbers: median 0.120 s to 0.077 s, peak RSS 297 MB to 151 MB. PERF.md has every change with its run.
 
 ## With another 24 hours
 
-Fuse parsing and counting to avoid the 37 MB record array (needs the endpoint ranks earlier). Replace the memory map with a `pread`-based reader to remove the page-fault and `madvise` kernel time, which is now about 40% of the CPU.
+Parsing is now about 20 ms above the cost of just reading the file (local), and the 10 MB of output is written in order by one thread at a time. A SIMD line splitter and a smaller per-line footprint than 6 bytes (the 19 MB of latency lists) are the next levers.

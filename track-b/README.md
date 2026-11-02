@@ -10,7 +10,7 @@ All 50,000 queries are known before the corpus is read, so only the terms they m
 
 The corpus is cut into 12 slices. Each thread tokenizes its documents with AVX2: 32 bytes are classified at once as token bytes (letters and digits) or separators, and bit tricks give the start and end of every token. A token's key is built with one 16-byte load, lowercased and masked to its length. Every token is looked up in the term table. For each document and query term one (term, document) pair is recorded (or, for very common terms, a bit is set directly in a per-term bitmap, which needs no pairs and no posting list). For phrase terms the thread also stores a 2-byte rank per token position, so a phrase can later be checked in place.
 
-Pairs are counting-sorted into per-term posting lists (slices are in document order, so each list comes out ascending). BOOL queries run strictly left to right on a document bitmap: a frequent term is a bitmap AND/OR/ANDNOT over 3,907 words, a rare term touches only its list; an empty result stops early when no OR is left. The count and the id sum come from popcounts, and only the first ten ids are collected bit by bit. PHRASE queries walk the documents of their rarest term and look for the phrase in the stored rank sequences.
+A pair is stored as a 2-byte term id (terms are numbered by falling frequency, so ids past 32,766 are rare and take two u16s), in a buffer reserved from the sampling pass's estimate. Pairs are counting-sorted into per-term posting lists of 16-bit offsets from the slice's first document (slices are in document order, so each list comes out ascending); a slice with more than 65,536 documents makes the scan repeat with twice as many slices. BOOL queries run strictly left to right on a document bitmap: a frequent term is a bitmap AND/OR/ANDNOT over 3,907 words, a rare term touches only its list; an empty result stops early when no OR is left. The count and the id sum come from popcounts, and only the first ten ids are collected bit by bit. PHRASE queries walk the documents of their rarest term and look for the phrase in the stored rank sequences.
 
 ## Correctness
 
@@ -32,7 +32,7 @@ None. The memory-map calls (`mmap`, `madvise`) are declared directly with `exter
 
 ## Results
 
-Median 0.61 s to 0.40 s (-34%), peak RSS 707,900 KB to 284,868 KB (-60%) (local laptop numbers; see PERF.md for the per-change log and the board runs once filled in).
+On the board: 0.260 s, 111 MB, 64.4 points (`run-95182e864c34`). Earlier local laptop numbers: median 0.61 s to 0.40 s, peak RSS 708 MB to 285 MB. PERF.md has every change with its run.
 
 ## With another 24 hours
 

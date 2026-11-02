@@ -8,7 +8,7 @@ The task, the input files and the exact output format are in the [spec](https://
 
 `records.csv` and `regions.csv` are mapped into memory. `regions.csv` becomes a dense table indexed by region id: a country code is three letters A-Z, so its base-26 number indexes a table of 26^3 entries directly, and walking that table in order gives the countries already sorted (with `_UNMATCHED` added last). Every region id then maps to its country index with one array read.
 
-`records.csv` is cut into 12 chunks, each starting at a true record start. A record start is found as "just after an LF, then an optional BOM, then a digit 1 to 9": lines inside a quoted note never start with a digit (a guarantee of the generator), so this can never land inside quotes. Each thread parses its chunk with a hand-written scanner: skip an optional BOM, read the id, read the name and the note (one function handles quoted and unquoted text and `""` escapes, copying bytes only when an escape occurs), read the region id and the amount in exact cents, then consume a CRLF or LF. It folds the record into per-country sums (count, id sum, amount sum, min, max, name bytes, note bytes). Distinct names are counted from 64-bit hashes of the unescaped name with the country in the low bits, split into 12 shards that are sorted and de-duplicated in parallel.
+`records.csv` is cut into 12 chunks, each starting at a true record start. A record start is found as "just after an LF, then an optional BOM, then a digit 1 to 9": lines inside a quoted note never start with a digit (a guarantee of the generator), so this can never land inside quotes. Each thread parses its chunk with a hand-written scanner: skip an optional BOM, read the id, read the name and the note (one function handles quoted and unquoted text and `""` escapes, copying bytes only when an escape occurs), read the region id and the amount in exact cents, then consume a CRLF or LF. It folds the record into per-country sums (count, id sum, amount sum, min, max, name bytes, note bytes). Distinct names are counted without storing anything per record: the 64-bit hash of the unescaped name is interned in one shared lock-free table (the first thread to see it claims a slot with a compare-and-swap and gets the next dense id), and the record sets the bit (name id, country). The table, the id and the bit are reached through prefetches one and two records ahead. If more than half the table fills, the file is parsed again with a table 8 times larger, so a larger name pool stays correct. Mapped pages behind each thread are handed back every 256 KB.
 
 Every chunk must stop exactly where the next one starts; if any does not, the whole file is parsed again on one thread, so a wrongly judged boundary can never corrupt the answer.
 
@@ -32,8 +32,8 @@ None. The memory-map calls (`mmap`, `madvise`) are declared directly with `exter
 
 ## Results
 
-Median 0.10 s to 0.059 s (-41%; mean 0.110 s to 0.059 s), peak RSS 267,992 KB to about 66,000 KB (-75%) (local laptop numbers; see PERF.md for the per-change log and the board runs once filled in).
+On the board: 0.0623 s, 13.4 MB, 68.4 points (`run-92aa3f276dfb`), from 0.057 s, 59.7 MB and 63.6 points with sorted per-record keys. Earlier local laptop numbers: median 0.10 s to 0.059 s. PERF.md has every change with its run.
 
 ## With another 24 hours
 
-Replace the memory map with a `pread`-based reader to remove the kernel time (about 30% of the CPU); count distinct names by partitioning the keys into buckets before sorting (est. -3 ms but +27 MB of memory).
+Counting distinct names is about half the run locally (about 28 ms of 60). Block reads instead of the map, and using the table slot as the name id, were tried and were not faster on the board (see PERF.md). A per-thread pre-filter for repeated (name, country) pairs is the next thing to try.
