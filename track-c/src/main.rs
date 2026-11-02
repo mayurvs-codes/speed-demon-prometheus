@@ -166,7 +166,8 @@ impl Pipeline {
 
 /// Everything a parsing thread needs to know about the join.
 struct Join<'a> {
-    country_of_region: &'a [u16],
+    country_of_region: &'a [u16], // used when there are more than 256 groups
+    country8: &'a [u8],           // otherwise this half-size copy (1 MB at full scale, so it stays in L2)
     unmatched: u16,
     countries: usize,
     names: &'a Names,
@@ -289,7 +290,11 @@ fn parse_chunk(d: &[u8], mut at: usize, end: usize, j: &Join) -> Part {
             at += if d[at] == b'\r' { 2 } else { 1 };
         }
 
-        let country = usize::from(*j.country_of_region.get(region).unwrap_or(&j.unmatched));
+        let country = if j.country8.is_empty() {
+            usize::from(*j.country_of_region.get(region).unwrap_or(&j.unmatched))
+        } else {
+            usize::from(j.country8.get(region).map_or(j.unmatched, |&c| u16::from(c)))
+        };
         let t = &mut part.totals[country];
         t.count += 1;
         t.id_sum += id;
@@ -393,8 +398,10 @@ fn main() {
     let mut first = if has_bom(records, 0) { 3 } else { 0 };
     first += records[first..].iter().position(|&c| c == b'\n').expect("header") + 1;
 
+    let country8: Vec<u8> = if keys.len() <= 256 { country_of_region.iter().map(|&c| c as u8).collect() } else { Vec::new() };
+    let country_of_region = if country8.is_empty() { country_of_region } else { Vec::new() };
     let parse_with = |parts: usize, names: &Names| -> Option<Vec<Part>> {
-        let join = Join { country_of_region: &country_of_region, unmatched, countries: keys.len(), names };
+        let join = Join { country_of_region: &country_of_region, country8: &country8, unmatched, countries: keys.len(), names };
         let mut cut = vec![first; parts + 1];
         cut[parts] = end;
         for i in 1..parts {
