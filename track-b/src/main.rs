@@ -112,7 +112,7 @@ struct Slice {
     pairs: Vec<u32>,      // the terms of each document, once per (term, doc), each document closed by u32::MAX
     per_term: Vec<u32>,   // number of pairs per term
     phrases: Vec<Answer>, // per phrase: the documents of this slice that contain it
-    lists: Vec<u32>,      // the pairs' documents grouped by term, ascending inside each term
+    lists: Vec<u16>,      // the pairs' documents (as doc - first) grouped by term, ascending inside each term
     start: Vec<u32>,      // term t's documents are lists[start[t]..start[t + 1]]
 }
 
@@ -131,10 +131,10 @@ fn group(s: &mut Slice) {
     s.start = std::iter::once(0).chain(s.per_term.iter().map(|&c| { n += c; n })).collect();
     let mut at = s.start.clone();
     s.lists = vec![0; n as usize];
-    let mut doc = s.first;
+    let mut doc = 0u16; // a slice holds at most 65,536 documents (checked by the caller)
     for &t in &s.pairs {
         if t == u32::MAX {
-            doc += 1;
+            doc = doc.wrapping_add(1);
         } else {
             s.lists[at[t as usize] as usize] = doc;
             at[t as usize] += 1;
@@ -193,7 +193,7 @@ fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmap
     while at < end {
         // Behind us the pages are finished with: hand whole pages back (MADV_DONTNEED drops only this process's
         // mapping; the file stays in the page cache), so the corpus never sits fully resident.
-        if at - released >= 1 << 20 {
+        if at - released >= 1 << 18 {
             let (lo, hi) = ((released + 4095) & !4095, at & !4095);
             unsafe { madvise(d.as_ptr().add(lo) as *mut u8, hi - lo, 4) };
             released = at;
@@ -483,16 +483,38 @@ fn run(vocab: &mut Vocab, queries: &mut [Query]) {
     }
 
     // 3. Scan the documents.
+    //    Posting lists hold 16-bit offsets from their slice's first document, so a slice may hold at most 65,536
+    //    documents; if one holds more, the scan is repeated with twice as many slices (setting a bitmap bit twice
+    //    is harmless).
     let bitmaps: Vec<AtomicU64> = (0..n_dense as usize * words_per_bitmap).map(|_| AtomicU64::new(0)).collect();
-    let slices: Vec<Slice> = thread::scope(|sc| {
-        let (vocab, cut, rows, bitmaps, ph) = (&vocab, &cut, &rows, &bitmaps, &ph);
-        let jobs: Vec<_> = (0..threads).map(|i| sc.spawn(move || {
-            let mut s = scan(docs, cut[i], cut[i + 1], vocab, rows, bitmaps, words_per_bitmap, ph);
-            group(&mut s);
-            s
-        })).collect();
-        jobs.into_iter().map(|j| j.join().unwrap()).collect()
-    });
+    let mut parts = threads;
+    let slices: Vec<Slice> = loop {
+        let mut cut = vec![0usize; parts + 1];
+        cut[parts] = docs.len();
+        for i in 1..parts {
+            let guess = (docs.len() * i / parts).max(cut[i - 1]);
+            cut[i] = docs[guess..].iter().position(|&c| c == b'\n').map_or(docs.len(), |k| guess + k + 1);
+        }
+        let slices: Vec<Slice> = thread::scope(|sc| {
+            let (vocab, cut, rows, bitmaps, ph) = (&vocab, &cut, &rows, &bitmaps, &ph);
+            let jobs: Vec<_> = (0..parts)
+                .map(|i| {
+                    sc.spawn(move || {
+                        let mut s = scan(docs, cut[i], cut[i + 1], vocab, rows, bitmaps, words_per_bitmap, ph);
+                        if s.count <= 1 << 16 {
+                            group(&mut s);
+                        }
+                        s
+                    })
+                })
+                .collect();
+            jobs.into_iter().map(|j| j.join().unwrap()).collect()
+        });
+        if slices.iter().all(|s| s.count <= 1 << 16) {
+            break slices;
+        }
+        parts *= 2;
+    };
 
     let bitmaps: Vec<u64> = bitmaps.iter().map(|w| w.load(Relaxed)).collect();
 
@@ -503,7 +525,7 @@ fn run(vocab: &mut Vocab, queries: &mut [Query]) {
         let jobs: Vec<_> = (0..threads)
             .map(|_| {
                 sc.spawn(move || {
-                    let list = |t: u32| slices.iter().flat_map(move |s| s.lists[s.start[t as usize] as usize..s.start[t as usize + 1] as usize].iter().copied());
+                    let list = |t: u32| slices.iter().flat_map(move |s| s.lists[s.start[t as usize] as usize..s.start[t as usize + 1] as usize].iter().map(move |&d| s.first + u32::from(d)));
                     let bitmap = |t: u32| -> Option<&[u64]> {
                         let r = rows[t as usize];
                         (r >= 0).then(|| &bitmaps[r as usize * words_per_bitmap..][..words_per_bitmap])
