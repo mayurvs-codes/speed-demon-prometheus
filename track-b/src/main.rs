@@ -132,7 +132,7 @@ impl Vocab {
 struct Slice {
     count: usize,         // documents scanned
     first: u32,           // id of the first document scanned (ids are dense, so the rest follow)
-    pairs: Vec<u32>,      // the terms of each document, once per (term, doc), each document closed by u32::MAX
+    pairs: Vec<u16>,      // the terms of each document, once per (term, doc), each document closed by DOC_END (see push_pair)
     per_term: Vec<u32>,   // number of pairs per term
     phrases: Vec<Answer>, // per phrase: the documents of this slice that contain it
     lists: Vec<u16>,      // the pairs' documents (as doc - first) grouped by term, ascending inside each term
@@ -148,6 +148,21 @@ struct TermState {
 
 const ANCHOR: u32 = 1 << 31;
 
+/// Closes a document in `Slice::pairs`.
+const DOC_END: u16 = 0x7FFF;
+
+/// Terms are numbered by falling frequency, so nearly every pair's term fits in 15 bits and takes 2 bytes; a larger
+/// id takes two u16s, the first with its top bit set.
+#[inline(always)]
+fn push_pair(pairs: &mut Vec<u16>, t: u32) {
+    if t < u32::from(DOC_END) {
+        pairs.push(t as u16);
+    } else {
+        pairs.push(0x8000 | (t >> 16) as u16);
+        pairs.push(t as u16);
+    }
+}
+
 /// Groups a slice's pairs by term with a counting sort. The pairs are in document order, so each group stays ascending.
 fn group(s: &mut Slice) {
     let mut n = 0;
@@ -155,13 +170,22 @@ fn group(s: &mut Slice) {
     let mut at = s.start.clone();
     s.lists = vec![0; n as usize];
     let mut doc = 0u16; // a slice holds at most 65,536 documents (checked by the caller)
-    for &t in &s.pairs {
-        if t == u32::MAX {
+    let mut i = 0;
+    while i < s.pairs.len() {
+        let w = s.pairs[i];
+        i += 1;
+        if w == DOC_END {
             doc = doc.wrapping_add(1);
-        } else {
-            s.lists[at[t as usize] as usize] = doc;
-            at[t as usize] += 1;
+            continue;
         }
+        let t = if w & 0x8000 == 0 {
+            usize::from(w)
+        } else {
+            i += 1;
+            usize::from(w & 0x7FFF) << 16 | usize::from(s.pairs[i - 1])
+        };
+        s.lists[at[t] as usize] = doc;
+        at[t] += 1;
     }
     s.pairs = Vec::new();
 }
@@ -205,8 +229,9 @@ unsafe fn token_key(d: &[u8], at: usize, len: usize) -> (u64, u64) {
 /// Scans the documents in d[at..end]. A term with a bitmap row (`rows[t] >= 0`) sets its bit directly; a term with no row
 /// records one (term, document) pair; a term that no BOOL query uses (`rows[t] == -2`) needs neither. Phrases are matched
 /// as each document ends.
-fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmaps: &[AtomicU64], words: usize, ph: &Phrases) -> Slice {
-    let mut s = Slice { phrases: (0..ph.terms.len()).map(|_| Answer::default()).collect(), ..Default::default() };
+#[allow(clippy::too_many_arguments)]
+fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmaps: &[AtomicU64], words: usize, ph: &Phrases, reserve: usize) -> Slice {
+    let mut s = Slice { phrases: (0..ph.terms.len()).map(|_| Answer::default()).collect(), pairs: Vec::with_capacity(reserve), ..Default::default() };
     // Everything the scan keeps per term sits together, so a token costs one cache miss here.
     let mut state: Vec<TermState> = rows.iter().enumerate().map(|(t, &row)| TermState { last_doc: 0, row, pairs: if ph.anchored[t >> 6] >> (t & 63) & 1 == 1 { ANCHOR } else { 0 } }).collect();
     let mut last_match = vec![0u32; ph.terms.len()]; // doc + 1 of the last match per phrase
@@ -304,14 +329,14 @@ fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmap
             if e.row != -2 && e.last_doc != doc + 1 {
                 e.last_doc = doc + 1;
                 if e.row < 0 {
-                    s.pairs.push(t);
+                    push_pair(&mut s.pairs, t);
                     e.pairs += 1;
                 } else {
                     bitmaps[e.row as usize * words + (doc >> 6) as usize].fetch_or(1 << (doc & 63), Relaxed);
                 }
             }
         }
-        s.pairs.push(u32::MAX);
+        s.pairs.push(DOC_END);
         for &i in &anchors {
             for &(p, off) in &ph.at[ids[i] as usize] {
                 let terms = ph.terms[p as usize];
@@ -464,7 +489,7 @@ fn run(vocab: &mut Vocab, queries: &mut [Query]) {
                     let (b, e) = (cut[i], cut[i + 1]);
                     let mid = b + (e - b) / 32;
                     let stop = docs[mid..e].iter().position(|&c| c == b'\n').map_or(e, |k| mid + k + 1);
-                    scan(docs, b, stop, vocab, no_rows, &[], 0, no_phrases)
+                    scan(docs, b, stop, vocab, no_rows, &[], 0, no_phrases, 0)
                 })
             })
             .collect();
@@ -525,6 +550,8 @@ fn run(vocab: &mut Vocab, queries: &mut [Query]) {
     //    is harmless).
     let bitmaps: Vec<AtomicU64> = (0..n_dense as usize * words_per_bitmap).map(|_| AtomicU64::new(0)).collect();
     let mut parts = threads;
+    // Pairs the sample predicts for the whole corpus (terms without a bitmap row), plus one closing mark per document.
+    let expected_pairs = (0..n_terms).filter(|&t| rows[t] == -1).map(|t| seen[t]).sum::<usize>() * n_docs / sampled_docs.max(1) + n_docs;
     let slices: Vec<Slice> = loop {
         let mut cut = vec![0usize; parts + 1];
         cut[parts] = docs.len();
@@ -537,7 +564,10 @@ fn run(vocab: &mut Vocab, queries: &mut [Query]) {
             let jobs: Vec<_> = (0..parts)
                 .map(|i| {
                     sc.spawn(move || {
-                        let mut s = scan(docs, cut[i], cut[i + 1], vocab, rows, bitmaps, words_per_bitmap, ph);
+                        // Reserving a quarter more than the slice's expected pairs avoids regrowing (and copying) the
+                        // buffer; reserved pages that are never written cost no memory.
+                        let reserve = expected_pairs / parts * 5 / 4;
+                        let mut s = scan(docs, cut[i], cut[i + 1], vocab, rows, bitmaps, words_per_bitmap, ph, reserve);
                         if s.count <= 1 << 16 {
                             group(&mut s);
                         }
@@ -553,7 +583,7 @@ fn run(vocab: &mut Vocab, queries: &mut [Query]) {
         parts *= 2;
     };
 
-    let bitmaps: Vec<u64> = bitmaps.iter().map(|w| w.load(Relaxed)).collect();
+    let bitmaps: Vec<u64> = bitmaps.into_iter().map(AtomicU64::into_inner).collect(); // reuses the allocation
 
     // 4. Answer the queries.
     let next = AtomicUsize::new(0);
