@@ -1,13 +1,12 @@
 // Track A: Ingest.
 // The log is cut into one byte range per thread; each thread reads its range in small blocks (no mapping)
-// and reduces its lines to compact records (endpoint, hour, latency, error flag). Records are then counting-sorted into one bucket
-// per (hour, endpoint); percentiles come from select_nth_unstable inside each bucket, and each
-// thread formats a range of hours so the output is simply the hours in order.
+// and appends each line's latency (4 bytes) and endpoint id with its 5xx flag (2 bytes) to that thread's lists for
+// the line's hour. No other per-line data exists. Each thread then takes a run of hours: it groups the hour's
+// lines by endpoint with a small counting sort, takes percentiles with select_nth_unstable and formats the hour.
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
 const HOURS: usize = 72;
@@ -30,12 +29,6 @@ fn line_start(f: &File, guess: u64, len: u64) -> u64 {
     len
 }
 
-/// Pointer shared by threads that write to provably disjoint slots.
-#[derive(Clone, Copy)]
-struct Disjoint<T>(*mut T);
-unsafe impl<T> Send for Disjoint<T> {}
-unsafe impl<T> Sync for Disjoint<T> {}
-
 /// A 64-bit hash of an endpoint name. The names of one file are told apart by this hash alone: 1,842 names make a
 /// collision about as likely as 1 in 10^13.
 #[inline(always)]
@@ -55,12 +48,6 @@ fn hash64(bytes: &[u8]) -> u64 {
     h ^= h >> 29;
     h = h.wrapping_mul(0x9FB2_1C65_1E98_DF25);
     h ^ (h >> 32)
-}
-
-#[derive(Clone, Copy)]
-struct Rec {
-    meta: u32, // thread-local endpoint id (24 bits), hour (7 bits), 5xx flag (1 bit); later replaced by the bucket number
-    latency: u32,
 }
 
 /// Open-addressing set of endpoint strings, assigning dense ids in first-seen order.
@@ -110,8 +97,11 @@ impl Dict {
     }
 }
 
+/// One thread's lines, split by hour: `lat[h][i]` and `ep[h][i]` describe the same line. `ep` holds the
+/// thread-local endpoint id in the low 15 bits (a seed has 1,842 endpoints) and the 5xx flag in the top bit.
 struct Chunk {
-    recs: Vec<Rec>,
+    lat: Vec<Vec<u32>>,
+    ep: Vec<Vec<u16>>,
     dict: Dict,
 }
 
@@ -169,14 +159,21 @@ fn read_lines(d: &[u8], c: &mut Chunk) {
             at += 1;
         }
         at += 1;
-        let endpoint = c.dict.id(name);
-        c.recs.push(Rec { meta: endpoint | u32::from(hour) << 24 | u32::from(server_error) << 31, latency });
+        let endpoint = c.dict.id(name) as u16;
+        c.lat[hour as usize].push(latency);
+        c.ep[hour as usize].push(endpoint | u16::from(server_error) << 15);
     }
 }
 
 /// Reads bytes `start..end` (which begin and end on line boundaries) in blocks and reduces them.
 fn read_chunk(f: &File, start: u64, end: u64) -> Chunk {
-    let mut c = Chunk { recs: Vec::with_capacity((end - start) as usize / 70 + 16), dict: Dict::new() };
+    // Lines average ~77 bytes; reserve twice an hour's expected share (pages never written cost no memory).
+    let per_hour = (end - start) as usize / 77 / HOURS * 2 + 64;
+    let mut c = Chunk {
+        lat: (0..HOURS).map(|_| Vec::with_capacity(per_hour)).collect(),
+        ep: (0..HOURS).map(|_| Vec::with_capacity(per_hour)).collect(),
+        dict: Dict::new(),
+    };
     let mut buf = vec![0u8; BLOCK];
     let (mut off, mut filled) = (start, 0);
     loop {
@@ -238,7 +235,7 @@ fn main() {
     for i in 1..threads {
         cut[i] = line_start(&f, (len * i as u64 / threads as u64).max(cut[i - 1]), len);
     }
-    let mut chunks: Vec<Chunk> = thread::scope(|sc| {
+    let chunks: Vec<Chunk> = thread::scope(|sc| {
         let (cut, f) = (&cut, &f);
         let jobs: Vec<_> = (0..threads).map(|i| sc.spawn(move || read_chunk(f, cut[i], cut[i + 1]))).collect();
         jobs.into_iter().map(|j| j.join().unwrap()).collect()
@@ -248,123 +245,57 @@ fn main() {
     let mut endpoints: Vec<Vec<u8>> = chunks.iter().flat_map(|c| c.dict.names.iter().cloned()).collect();
     endpoints.sort_unstable();
     endpoints.dedup();
+    assert!(chunks.iter().all(|c| c.dict.names.len() < 1 << 15), "too many endpoints for 15-bit ids");
     let width = endpoints.len();
-    let buckets = HOURS * width;
+    let ranks: Vec<Vec<u32>> =
+        chunks.iter().map(|c| c.dict.names.iter().map(|n| endpoints.binary_search(n).unwrap() as u32).collect()).collect();
 
-    // Single compact atomic errors array (530 KB instead of 6.4 MB per-thread error tracking)
-    let errors: Vec<AtomicU32> = (0..buckets).map(|_| AtomicU32::new(0)).collect();
-
-    // Counting sort: each thread keeps only a u32 count per bucket (6.3 MB total, 50% less memory than [u32; 2])
-    let mut pos: Vec<Vec<u32>> = thread::scope(|sc| {
-        let endpoints = &endpoints;
-        let errors = &errors;
-        let jobs: Vec<_> = chunks
-            .iter_mut()
-            .map(|c| {
-                sc.spawn(move || {
-                    let rank: Vec<u32> = c.dict.names.iter().map(|n| endpoints.binary_search(n).unwrap() as u32).collect();
-                    let mut count = vec![0u32; buckets];
-                    for r in c.recs.iter_mut() {
-                        let b = (r.meta >> 24 & 127) as usize * width + rank[(r.meta & 0xFF_FFFF) as usize] as usize;
-                        if r.meta >> 31 != 0 {
-                            errors[b].fetch_add(1, Ordering::Relaxed);
-                        }
-                        r.meta = b as u32;
-                        count[b] += 1;
-                    }
-                    count
-                })
-            })
-            .collect();
-        jobs.into_iter().map(|j| j.join().unwrap()).collect()
-    });
-
-    // Totals and start positions in parallel over ranges of buckets using 4-byte arrays
-    let nt = pos.len().max(1);
-    let per = buckets.div_ceil(nt).max(1);
-    let arrays: Vec<Disjoint<u32>> = pos.iter_mut().map(|p| Disjoint(p.as_mut_ptr())).collect();
-    let mut begin = vec![0u32; buckets + 1];
-
-    thread::scope(|sc| {
-        for (i, total) in begin[1..].chunks_mut(per).enumerate() {
-            let arrays = &arrays;
-            sc.spawn(move || {
-                for (k, t) in total.iter_mut().enumerate() {
-                    let idx = i * per + k;
-                    let mut sum = 0u32;
-                    for a in arrays.iter() {
-                        sum += unsafe { *a.0.add(idx) };
-                    }
-                    *t = sum;
-                }
-            });
-        }
-    });
-
-    for b in 0..buckets {
-        begin[b + 1] += begin[b];
-    }
-
-    thread::scope(|sc| {
-        for i in 0..nt {
-            let (arrays, begin) = (&arrays, &begin);
-            sc.spawn(move || {
-                for b in (i * per).min(buckets)..((i + 1) * per).min(buckets) {
-                    let mut at = begin[b];
-                    for a in arrays.iter() {
-                        let c = unsafe { &mut *a.0.add(b) };
-                        let n = *c;
-                        *c = at;
-                        at += n;
-                    }
-                }
-            });
-        }
-    });
-
-    let mut latencies = vec![0u32; begin[buckets] as usize];
-    let dst = Disjoint(latencies.as_mut_ptr());
-
-    // Scatter latencies straight into bucket slots, then drop chunks and pos immediately
-    thread::scope(|sc| {
-        for (c, mut p) in chunks.into_iter().zip(pos) {
-            sc.spawn(move || {
-                let dst = dst;
-                for r in &c.recs {
-                    let slot = &mut p[r.meta as usize];
-                    unsafe { *dst.0.add(*slot as usize) = r.latency };
-                    *slot += 1;
-                }
-            });
-        }
-    });
-
-    // Each thread takes a run of hours: its latency range and output slots are disjoint.
+    // Each thread takes a run of hours. Per hour: count lines per endpoint, place the latencies grouped by
+    // endpoint into one small buffer (a counting sort that stays in cache), then select the percentiles.
     let labels = hour_labels();
     let mut hour_out: Vec<Vec<u8>> = vec![Vec::new(); HOURS];
     {
-        let (begin, errors, endpoints, labels) = (&begin, &errors, &endpoints, &labels);
-        let mut lat_left: &mut [u32] = &mut latencies;
+        let (chunks, ranks, endpoints, labels) = (&chunks, &ranks, &endpoints, &labels);
         let mut out_left: &mut [Vec<u8>] = &mut hour_out;
         thread::scope(|sc| {
             for t in 0..threads {
                 let (h0, h1) = (HOURS * t / threads, HOURS * (t + 1) / threads);
-                let (lat, rest) = std::mem::take(&mut lat_left).split_at_mut((begin[h1 * width] - begin[h0 * width]) as usize);
-                lat_left = rest;
                 let (outs, rest) = std::mem::take(&mut out_left).split_at_mut(h1 - h0);
                 out_left = rest;
-                let base = begin[h0 * width] as usize;
                 sc.spawn(move || {
+                    let mut begin = vec![0u32; width + 1];
+                    let mut errors = vec![0u32; width];
+                    let mut lat: Vec<u32> = Vec::new();
                     for (h, out) in (h0..h1).zip(outs.iter_mut()) {
+                        begin.fill(0);
+                        errors.fill(0);
+                        for (c, rank) in chunks.iter().zip(ranks) {
+                            for &e in &c.ep[h] {
+                                let r = rank[usize::from(e & 0x7FFF)] as usize;
+                                begin[r + 1] += 1;
+                                errors[r] += u32::from(e >> 15);
+                            }
+                        }
+                        for e in 0..width {
+                            begin[e + 1] += begin[e];
+                        }
+                        let mut next = begin.clone();
+                        lat.clear();
+                        lat.resize(begin[width] as usize, 0);
+                        for (c, rank) in chunks.iter().zip(ranks) {
+                            for (&e, &l) in c.ep[h].iter().zip(&c.lat[h]) {
+                                let slot = &mut next[rank[usize::from(e & 0x7FFF)] as usize];
+                                lat[*slot as usize] = l;
+                                *slot += 1;
+                            }
+                        }
                         out.reserve(width * 80);
                         for (e, endpoint) in endpoints.iter().enumerate() {
-                            let b = h * width + e;
-                            let (lo, hi) = (begin[b] as usize - base, begin[b + 1] as usize - base);
-                            let n = hi - lo;
+                            let v = &mut lat[begin[e] as usize..begin[e + 1] as usize];
+                            let n = v.len();
                             if n == 0 {
                                 continue;
                             }
-                            let v = &mut lat[lo..hi];
                             // Nearest rank: ceil(p * n / 100), 1-indexed.
                             let rank = |p: usize| (p * n + 99) / 100;
                             let (r50, r95, r99) = (rank(50), rank(95), rank(99));
@@ -378,7 +309,7 @@ fn main() {
                                 v[..r95 - 1].select_nth_unstable(r50 - 1);
                             }
                             let p50 = v[r50 - 1];
-                            let errs = u64::from(errors[b].load(Ordering::Relaxed));
+                            let errs = u64::from(errors[e]);
                             out.extend_from_slice(labels[h].as_bytes());
                             out.extend_from_slice(endpoint);
                             for x in [n as u64, u64::from(p50), u64::from(p95), u64::from(p99), errs, errs * 1_000_000 / n as u64] {
@@ -392,8 +323,6 @@ fn main() {
             }
         });
     }
-
-    drop(latencies);
 
     let mut f = File::create("/out/summary.txt").expect("create output");
     for out in &hour_out {
