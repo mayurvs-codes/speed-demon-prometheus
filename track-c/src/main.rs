@@ -1,12 +1,13 @@
 // Track C: Join.
 // records.csv is mapped and cut into one chunk per thread at record starts. Each thread parses
 // its records, looks the region up in a dense table and folds the record into per-country sums.
-// Distinct names are counted from 64-bit hashes of the unescaped value, split into shards that
-// are deduplicated in parallel.
+// Distinct names: every thread interns the 64-bit hash of the unescaped name in one shared lock-free table that
+// hands out dense name ids, and sets the bit (name id, country). No per-record key is stored.
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread;
 
 extern "C" {
@@ -68,20 +69,94 @@ impl Totals {
     }
 }
 
+/// Lock-free set of name hashes shared by all threads. A name's id is its order of first insertion, so the
+/// (name, country) bits stay dense. It holds at most half of `slots`, which keeps probes short; a file with more
+/// distinct names sets `full` and is parsed again with a bigger table.
+struct Names {
+    slots: Vec<AtomicU64>, // name hash (never 0); 0 = empty
+    ids: Vec<AtomicU32>,   // id + 1 of the name in the same slot; 0 = not yet published
+    next: AtomicU32,
+    full: AtomicBool,
+    words: usize,         // u64 words of country bits per name
+    seen: Vec<AtomicU64>, // bit (id, country) is at seen[id * words + country / 64]
+}
+
+impl Names {
+    fn new(capacity: usize, countries: usize) -> Self {
+        let words = countries.div_ceil(64);
+        Names {
+            slots: (0..capacity).map(|_| AtomicU64::new(0)).collect(),
+            ids: (0..capacity).map(|_| AtomicU32::new(0)).collect(),
+            next: AtomicU32::new(0),
+            full: AtomicBool::new(false),
+            words,
+            seen: (0..capacity / 2 * words).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    fn id(&self, hash: u64) -> usize {
+        let h = hash.max(1);
+        let mask = self.slots.len() - 1;
+        let mut i = h as usize & mask;
+        loop {
+            let mut cur = self.slots[i].load(Ordering::Acquire);
+            if cur == 0 {
+                if self.next.load(Ordering::Relaxed) as usize >= self.slots.len() / 2 {
+                    self.full.store(true, Ordering::Relaxed);
+                    return 0;
+                }
+                match self.slots[i].compare_exchange(0, h, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => {
+                        let id = self.next.fetch_add(1, Ordering::Relaxed);
+                        if id as usize >= self.slots.len() / 2 {
+                            self.full.store(true, Ordering::Relaxed);
+                            return 0;
+                        }
+                        self.ids[i].store(id + 1, Ordering::Release);
+                        return id as usize;
+                    }
+                    Err(now) => cur = now,
+                }
+            }
+            if cur == h {
+                // Another thread may have claimed the slot and not yet published its id.
+                loop {
+                    let id = self.ids[i].load(Ordering::Acquire);
+                    if id != 0 {
+                        return id as usize - 1;
+                    }
+                    if self.full.load(Ordering::Relaxed) {
+                        return 0;
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    fn mark(&self, hash: u64, country: usize) {
+        let id = self.id(hash);
+        let (word, bit) = (&self.seen[id * self.words + country / 64], 1u64 << (country % 64));
+        // Most pairs repeat: read first so the shared line is written only when the bit is new.
+        if word.load(Ordering::Relaxed) & bit == 0 {
+            word.fetch_or(bit, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Everything a parsing thread needs to know about the join.
 struct Join<'a> {
     country_of_region: &'a [u16],
     unmatched: u16,
     countries: usize,
-    country_bits: u32,
-    shards: usize,
+    names: &'a Names,
 }
 
 /// What one thread produced from its chunk.
 struct Part {
     totals: Vec<Totals>,
-    keys: Vec<Vec<u64>>, // (name hash with the country in its low bits), bucketed by shard
-    end: usize,          // where parsing stopped; must equal the next chunk's start
+    end: usize, // where parsing stopped; must equal the next chunk's start
     ok: bool,
 }
 
@@ -148,16 +223,13 @@ fn field(d: &[u8], at: usize, scratch: &mut Vec<u8>, want_hash: bool) -> Option<
 }
 
 fn parse_chunk(d: &[u8], mut at: usize, end: usize, j: &Join) -> Part {
-    // Records average ~60 bytes; reserve each shard's expected share up front (untouched pages cost no memory).
-    let per_shard = (end - at) / 50 / j.shards;
-    let mut part = Part { totals: vec![Totals::NONE; j.countries], keys: (0..j.shards).map(|_| Vec::with_capacity(per_shard)).collect(), end: 0, ok: true };
+    let mut part = Part { totals: vec![Totals::NONE; j.countries], end: 0, ok: true };
     let mut scratch = Vec::new();
-    let country_mask = (1u64 << j.country_bits) - 1;
     let mut released = at;
     while at < end {
         // Behind us the pages are finished with: hand whole pages back (MADV_DONTNEED drops only this process's
         // mapping; the file stays in the page cache), so the input never sits fully resident.
-        if at - released >= 1 << 22 {
+        if at - released >= 1 << 18 {
             let (lo, hi) = ((released + 4095) & !4095, at & !4095);
             unsafe { madvise(d.as_ptr().add(lo) as *mut u8, hi - lo, 4) };
             released = at;
@@ -206,8 +278,7 @@ fn parse_chunk(d: &[u8], mut at: usize, end: usize, j: &Join) -> Part {
         t.cents_sum += cents;
         t.cents_min = t.cents_min.min(cents);
         t.cents_max = t.cents_max.max(cents);
-        let key = (name_hash & !country_mask) | country as u64;
-        part.keys[((key >> j.country_bits) % j.shards as u64) as usize].push(key);
+        j.names.mark(name_hash, country);
     }
     part.end = at;
     part
@@ -294,15 +365,14 @@ fn main() {
         country_of_region[id] = index_of_code[code];
         at += 4;
     }
-    let country_bits = usize::BITS - (keys.len() - 1).leading_zeros();
 
     let threads = thread::available_parallelism().map_or(1, |t| t.get()).clamp(1, 12);
     let end = records.len();
     let mut first = if has_bom(records, 0) { 3 } else { 0 };
     first += records[first..].iter().position(|&c| c == b'\n').expect("header") + 1;
 
-    let parse_with = |parts: usize| -> Option<Vec<Part>> {
-        let join = Join { country_of_region: &country_of_region, unmatched, countries: keys.len(), country_bits, shards: parts };
+    let parse_with = |parts: usize, names: &Names| -> Option<Vec<Part>> {
+        let join = Join { country_of_region: &country_of_region, unmatched, countries: keys.len(), names };
         let mut cut = vec![first; parts + 1];
         cut[parts] = end;
         for i in 1..parts {
@@ -317,30 +387,40 @@ fn main() {
         let lined_up = done.iter().enumerate().all(|(i, p)| p.ok && p.end == cut[i + 1]);
         lined_up.then_some(done)
     };
-    let (parts, shards) = match parse_with(threads) {
-        Some(p) => (p, threads),
-        None => (parse_with(1).expect("single-threaded parse"), 1),
+    // Start with 2^18 slots; a file with more than half that many distinct names is parsed again with 8x the room.
+    let mut capacity = 1 << 18;
+    let (parts, names) = loop {
+        let names = Names::new(capacity, keys.len());
+        let parts = match parse_with(threads, &names) {
+            Some(p) => p,
+            None => {
+                let names = Names::new(capacity, keys.len());
+                let p = parse_with(1, &names).expect("single-threaded parse");
+                if names.full.load(Ordering::Relaxed) {
+                    capacity *= 8;
+                    continue;
+                }
+                break (p, names);
+            }
+        };
+        if names.full.load(Ordering::Relaxed) {
+            capacity *= 8;
+            continue;
+        }
+        break (parts, names);
     };
 
-    // Each thread owns one shard of the (name hash, country) keys: sort, dedupe, count per country.
-    let distinct: Vec<Vec<u64>> = thread::scope(|sc| {
-        let (parts, countries) = (&parts, keys.len());
-        let jobs: Vec<_> = (0..shards)
-            .map(|s| {
-                sc.spawn(move || {
-                    let mut all: Vec<u64> = parts.iter().flat_map(|p| p.keys[s].iter().copied()).collect();
-                    all.sort_unstable();
-                    all.dedup();
-                    let mut per_country = vec![0u64; countries];
-                    for k in all {
-                        per_country[(k & ((1u64 << country_bits) - 1)) as usize] += 1;
-                    }
-                    per_country
-                })
-            })
-            .collect();
-        jobs.into_iter().map(|j| j.join().unwrap()).collect()
-    });
+    // names_distinct per country: the set bits of that country across all name ids.
+    let mut distinct = vec![0u64; keys.len()];
+    for row in names.seen[..names.next.load(Ordering::Relaxed) as usize * names.words].chunks(names.words) {
+        for (w, word) in row.iter().enumerate() {
+            let mut bits = word.load(Ordering::Relaxed);
+            while bits != 0 {
+                distinct[w * 64 + bits.trailing_zeros() as usize] += 1;
+                bits &= bits - 1;
+            }
+        }
+    }
 
     let mut out = Vec::with_capacity(keys.len() * 100);
     for (c, code) in keys.iter().enumerate() {
@@ -358,7 +438,7 @@ fn main() {
             out.push(b' ');
             push_money(&mut out, m);
         }
-        for v in [distinct.iter().map(|d| d[c]).sum::<u64>(), t.name_bytes, t.note_bytes] {
+        for v in [distinct[c], t.name_bytes, t.note_bytes] {
             out.push(b' ');
             push_int(&mut out, v);
         }
