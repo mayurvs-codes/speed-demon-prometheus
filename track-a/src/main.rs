@@ -7,6 +7,7 @@ use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 const HOURS: usize = 72;
@@ -250,82 +251,85 @@ fn main() {
     let ranks: Vec<Vec<u32>> =
         chunks.iter().map(|c| c.dict.names.iter().map(|n| endpoints.binary_search(n).unwrap() as u32).collect()).collect();
 
-    // Each thread takes a run of hours. Per hour: count lines per endpoint, place the latencies grouped by
-    // endpoint into one small buffer (a counting sort that stays in cache), then select the percentiles.
+    // Threads take hours in order. Per hour: count lines per endpoint, place the latencies grouped by endpoint
+    // into one small buffer (a counting sort that stays in cache), select the percentiles and format the lines.
+    // An hour's text is appended to the file as soon as every earlier hour is written, so at most one hour per
+    // thread is ever held in memory.
     let labels = hour_labels();
-    let mut hour_out: Vec<Vec<u8>> = vec![Vec::new(); HOURS];
-    {
-        let (chunks, ranks, endpoints, labels) = (&chunks, &ranks, &endpoints, &labels);
-        let mut out_left: &mut [Vec<u8>] = &mut hour_out;
-        thread::scope(|sc| {
-            for t in 0..threads {
-                let (h0, h1) = (HOURS * t / threads, HOURS * (t + 1) / threads);
-                let (outs, rest) = std::mem::take(&mut out_left).split_at_mut(h1 - h0);
-                out_left = rest;
-                sc.spawn(move || {
-                    let mut begin = vec![0u32; width + 1];
-                    let mut errors = vec![0u32; width];
-                    let mut lat: Vec<u32> = Vec::new();
-                    for (h, out) in (h0..h1).zip(outs.iter_mut()) {
-                        begin.fill(0);
-                        errors.fill(0);
-                        for (c, rank) in chunks.iter().zip(ranks) {
-                            for &e in &c.ep[h] {
-                                let r = rank[usize::from(e & 0x7FFF)] as usize;
-                                begin[r + 1] += 1;
-                                errors[r] += u32::from(e >> 15);
-                            }
-                        }
-                        for e in 0..width {
-                            begin[e + 1] += begin[e];
-                        }
-                        let mut next = begin.clone();
-                        lat.clear();
-                        lat.resize(begin[width] as usize, 0);
-                        for (c, rank) in chunks.iter().zip(ranks) {
-                            for (&e, &l) in c.ep[h].iter().zip(&c.lat[h]) {
-                                let slot = &mut next[rank[usize::from(e & 0x7FFF)] as usize];
-                                lat[*slot as usize] = l;
-                                *slot += 1;
-                            }
-                        }
-                        out.reserve(width * 80);
-                        for (e, endpoint) in endpoints.iter().enumerate() {
-                            let v = &mut lat[begin[e] as usize..begin[e + 1] as usize];
-                            let n = v.len();
-                            if n == 0 {
-                                continue;
-                            }
-                            // Nearest rank: ceil(p * n / 100), 1-indexed.
-                            let rank = |p: usize| (p * n + 99) / 100;
-                            let (r50, r95, r99) = (rank(50), rank(95), rank(99));
-                            v.select_nth_unstable(r99 - 1);
-                            let p99 = v[r99 - 1];
-                            if r95 < r99 {
-                                v[..r99 - 1].select_nth_unstable(r95 - 1);
-                            }
-                            let p95 = v[r95 - 1];
-                            if r50 < r95 {
-                                v[..r95 - 1].select_nth_unstable(r50 - 1);
-                            }
-                            let p50 = v[r50 - 1];
-                            let errs = u64::from(errors[e]);
-                            out.extend_from_slice(labels[h].as_bytes());
-                            out.extend_from_slice(endpoint);
-                            for x in [n as u64, u64::from(p50), u64::from(p95), u64::from(p99), errs, errs * 1_000_000 / n as u64] {
-                                out.push(b' ');
-                                push_int(out, x);
-                            }
-                            out.push(b'\n');
+    let file = File::create("/out/summary.txt").expect("create output");
+    let (next_hour, written) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    thread::scope(|sc| {
+        for _ in 0..threads {
+            let (chunks, ranks, endpoints, labels, file, next_hour, written) = (&chunks, &ranks, &endpoints, &labels, &file, &next_hour, &written);
+            sc.spawn(move || {
+                let mut begin = vec![0u32; width + 1];
+                let mut errors = vec![0u32; width];
+                let mut lat: Vec<u32> = Vec::new();
+                let mut text: Vec<u8> = Vec::with_capacity(width * 80);
+                let out = &mut text;
+                loop {
+                    let h = next_hour.fetch_add(1, Ordering::Relaxed);
+                    if h >= HOURS {
+                        break;
+                    }
+                    out.clear();
+                    begin.fill(0);
+                    errors.fill(0);
+                    for (c, rank) in chunks.iter().zip(ranks) {
+                        for &e in &c.ep[h] {
+                            let r = rank[usize::from(e & 0x7FFF)] as usize;
+                            begin[r + 1] += 1;
+                            errors[r] += u32::from(e >> 15);
                         }
                     }
-                });
-            }
-        });
-    }
-
-    let mut f = File::create("/out/summary.txt").expect("create output");
-    for out in &hour_out {
-        f.write_all(out).expect("write output");
-    }
+                    for e in 0..width {
+                        begin[e + 1] += begin[e];
+                    }
+                    let mut next = begin.clone();
+                    lat.clear();
+                    lat.resize(begin[width] as usize, 0);
+                    for (c, rank) in chunks.iter().zip(ranks) {
+                        for (&e, &l) in c.ep[h].iter().zip(&c.lat[h]) {
+                            let slot = &mut next[rank[usize::from(e & 0x7FFF)] as usize];
+                            lat[*slot as usize] = l;
+                            *slot += 1;
+                        }
+                    }
+                    for (e, endpoint) in endpoints.iter().enumerate() {
+                        let v = &mut lat[begin[e] as usize..begin[e + 1] as usize];
+                        let n = v.len();
+                        if n == 0 {
+                            continue;
+                        }
+                        // Nearest rank: ceil(p * n / 100), 1-indexed.
+                        let rank = |p: usize| (p * n + 99) / 100;
+                        let (r50, r95, r99) = (rank(50), rank(95), rank(99));
+                        v.select_nth_unstable(r99 - 1);
+                        let p99 = v[r99 - 1];
+                        if r95 < r99 {
+                            v[..r99 - 1].select_nth_unstable(r95 - 1);
+                        }
+                        let p95 = v[r95 - 1];
+                        if r50 < r95 {
+                            v[..r95 - 1].select_nth_unstable(r50 - 1);
+                        }
+                        let p50 = v[r50 - 1];
+                        let errs = u64::from(errors[e]);
+                        out.extend_from_slice(labels[h].as_bytes());
+                        out.extend_from_slice(endpoint);
+                        for x in [n as u64, u64::from(p50), u64::from(p95), u64::from(p99), errs, errs * 1_000_000 / n as u64] {
+                            out.push(b' ');
+                            push_int(out, x);
+                        }
+                        out.push(b'\n');
+                    }
+                    while written.load(Ordering::Acquire) != h {
+                        thread::yield_now();
+                    }
+                    (&*file).write_all(out).expect("write output");
+                    written.store(h + 1, Ordering::Release);
+                }
+            });
+        }
+    });
 }
