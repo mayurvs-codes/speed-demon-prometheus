@@ -242,14 +242,36 @@ fn main() {
         jobs.into_iter().map(|j| j.join().unwrap()).collect()
     });
 
-    // One global, byte-ordered endpoint list; its index is the endpoint's rank within an hour.
-    let mut endpoints: Vec<Vec<u8>> = chunks.iter().flat_map(|c| c.dict.names.iter().cloned()).collect();
-    endpoints.sort_unstable();
-    endpoints.dedup();
+    // One global, byte-ordered endpoint list; its index is the endpoint's rank within an hour. Every thread has
+    // seen most names, so the (hash, thread, id) triples are grouped by hash first and only one name per group
+    // is sorted as bytes.
     assert!(chunks.iter().all(|c| c.dict.names.len() < 1 << 15), "too many endpoints for 15-bit ids");
-    let width = endpoints.len();
-    let ranks: Vec<Vec<u32>> =
-        chunks.iter().map(|c| c.dict.names.iter().map(|n| endpoints.binary_search(n).unwrap() as u32).collect()).collect();
+    let mut all: Vec<(u64, u32, u32)> = chunks
+        .iter()
+        .enumerate()
+        .flat_map(|(k, c)| c.dict.names.iter().enumerate().map(move |(id, n)| (hash64(n), k as u32, id as u32)))
+        .collect();
+    all.sort_unstable();
+    let mut groups: Vec<(&[u8], usize)> = Vec::new(); // (name, index of the group's first triple)
+    for (i, &(h, k, id)) in all.iter().enumerate() {
+        if i == 0 || all[i - 1].0 != h {
+            groups.push((&chunks[k as usize].dict.names[id as usize], i));
+        }
+    }
+    groups.sort_unstable();
+    let width = groups.len();
+    let mut ranks: Vec<Vec<u32>> = chunks.iter().map(|c| vec![0; c.dict.names.len()]).collect();
+    let mut group_rank = vec![0u32; all.len()];
+    for (rank, &(_, first)) in groups.iter().enumerate() {
+        group_rank[first] = rank as u32;
+    }
+    for (i, &(h, k, id)) in all.iter().enumerate() {
+        if i > 0 && all[i - 1].0 == h {
+            group_rank[i] = group_rank[i - 1];
+        }
+        ranks[k as usize][id as usize] = group_rank[i];
+    }
+    let endpoints: Vec<&[u8]> = groups.iter().map(|&(n, _)| n).collect();
 
     // Threads take hours in order. Per hour: count lines per endpoint, place the latencies grouped by endpoint
     // into one small buffer (a counting sort that stays in cache), select the percentiles and format the lines.
