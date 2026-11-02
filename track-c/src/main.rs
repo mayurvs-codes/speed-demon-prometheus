@@ -1,18 +1,18 @@
 // Track C: Join.
-// records.csv is mapped and cut into one chunk per thread at record starts. Each thread parses
-// its records, looks the region up in a dense table and folds the record into per-country sums.
+// records.csv is cut into one chunk per thread at record starts. Each thread reads its chunk in blocks, parses the
+// whole records in each block, looks the region up in a dense table and folds the record into per-country sums.
 // Distinct names: every thread interns the 64-bit hash of the unescaped name in one shared lock-free table that
 // hands out dense name ids, and sets the bit (name id, country). No per-record key is stored.
 use std::arch::x86_64::*;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
 /// Maps a file read-only into memory (std has no mmap, so this declares the libc call).
@@ -259,69 +259,131 @@ fn field(d: &[u8], at: usize, scratch: &mut Vec<u8>, want_hash: bool) -> Option<
     }
 }
 
-fn parse_chunk(d: &[u8], mut at: usize, end: usize, j: &Join) -> Part {
-    let mut part = Part { totals: vec![Totals::NONE; j.countries], end: 0, ok: true };
-    let mut scratch = Vec::new();
-    let mut pipeline = Pipeline::default();
-    let mut released = at;
-    while at < end {
-        // Behind us the pages are finished with: hand whole pages back (MADV_DONTNEED drops only this process's
-        // mapping; the file stays in the page cache), so the input never sits fully resident.
-        if at - released >= 1 << 18 {
-            let (lo, hi) = ((released + 4095) & !4095, at & !4095);
-            unsafe { madvise(d.as_ptr().add(lo) as *mut u8, hi - lo, 4) };
-            released = at;
-        }
-        if has_bom(d, at) {
-            at += 3;
-        }
-        let mut id = 0u64;
-        while d[at] != b',' {
-            id = id * 10 + u64::from(d[at] - b'0');
-            at += 1;
-        }
-        at += 1;
-        let Some((stop, name_len, name_hash)) = field(d, at, &mut scratch, true) else { part.ok = false; return part };
-        at = stop + 1;
-        let Some((stop, note_len, _)) = field(d, at, &mut scratch, false) else { part.ok = false; return part };
-        at = stop + 1;
-        let mut region = 0usize;
-        while d[at] != b',' {
-            region = region * 10 + usize::from(d[at] - b'0');
-            at += 1;
-        }
-        at += 1;
-        let negative = d[at] == b'-';
-        at += usize::from(negative);
-        let mut cents = 0i64;
-        while d[at] != b'.' {
-            cents = cents * 10 + i64::from(d[at] - b'0');
-            at += 1;
-        }
-        cents = cents * 100 + i64::from(d[at + 1] - b'0') * 10 + i64::from(d[at + 2] - b'0');
-        at += 3;
-        if negative {
-            cents = -cents;
-        }
-        if at < d.len() {
-            at += if d[at] == b'\r' { 2 } else { 1 };
-        }
+/// One thread's parsing state, carried from block to block.
+struct Parser {
+    part: Part,
+    scratch: Vec<u8>,
+    pipeline: Pipeline,
+}
 
-        let country = usize::from(*j.country_of_region.get(region).unwrap_or(&j.unmatched));
-        let t = &mut part.totals[country];
-        t.count += 1;
-        t.id_sum += id;
-        t.name_bytes += name_len;
-        t.note_bytes += note_len;
-        t.cents_sum += cents;
-        t.cents_min = t.cents_min.min(cents);
-        t.cents_max = t.cents_max.max(cents);
-        pipeline.push(j.names, Some((name_hash, country)));
+impl Parser {
+    fn new(j: &Join) -> Self {
+        Parser { part: Part { totals: vec![Totals::NONE; j.countries], end: 0, ok: true }, scratch: Vec::new(), pipeline: Pipeline::default() }
     }
-    pipeline.push(j.names, None);
-    pipeline.push(j.names, None);
-    part.end = at;
+
+    /// Parses the records in d[at..end], which must end at a record boundary. Returns where parsing stopped, or None
+    /// when a quoted field is not closed.
+    fn records(&mut self, d: &[u8], mut at: usize, end: usize, j: &Join) -> Option<usize> {
+        while at < end {
+            if has_bom(d, at) {
+                at += 3;
+            }
+            let mut id = 0u64;
+            while d[at] != b',' {
+                id = id * 10 + u64::from(d[at] - b'0');
+                at += 1;
+            }
+            at += 1;
+            let Some((stop, name_len, name_hash)) = field(d, at, &mut self.scratch, true) else { return None };
+            at = stop + 1;
+            let Some((stop, note_len, _)) = field(d, at, &mut self.scratch, false) else { return None };
+            at = stop + 1;
+            let mut region = 0usize;
+            while d[at] != b',' {
+                region = region * 10 + usize::from(d[at] - b'0');
+                at += 1;
+            }
+            at += 1;
+            let negative = d[at] == b'-';
+            at += usize::from(negative);
+            let mut cents = 0i64;
+            while d[at] != b'.' {
+                cents = cents * 10 + i64::from(d[at] - b'0');
+                at += 1;
+            }
+            cents = cents * 100 + i64::from(d[at + 1] - b'0') * 10 + i64::from(d[at + 2] - b'0');
+            at += 3;
+            if negative {
+                cents = -cents;
+            }
+            if at < d.len() {
+                at += if d[at] == b'\r' { 2 } else { 1 };
+            }
+
+            let country = usize::from(*j.country_of_region.get(region).unwrap_or(&j.unmatched));
+            let t = &mut self.part.totals[country];
+            t.count += 1;
+            t.id_sum += id;
+            t.name_bytes += name_len;
+            t.note_bytes += note_len;
+            t.cents_sum += cents;
+            t.cents_min = t.cents_min.min(cents);
+            t.cents_max = t.cents_max.max(cents);
+            self.pipeline.push(j.names, Some((name_hash, country)));
+        }
+        Some(at)
+    }
+
+    fn finish(mut self, j: &Join, end: usize) -> Part {
+        self.pipeline.push(j.names, None);
+        self.pipeline.push(j.names, None);
+        self.part.end = end;
+        self.part
+    }
+}
+
+/// Parses d[at..end] of the mapped file (the single-threaded fallback).
+fn parse_chunk(d: &[u8], at: usize, end: usize, j: &Join) -> Part {
+    let mut p = Parser::new(j);
+    let stop = p.records(d, at, end, j);
+    let mut part = p.finish(j, stop.unwrap_or(0));
+    part.ok = stop.is_some();
     part
+}
+
+/// The last record start in `d` after position 0 (an LF, an optional BOM, then a digit 1-9), or 0 if none is known yet.
+fn last_record_start(d: &[u8]) -> usize {
+    let mut i = d.len();
+    while let Some(k) = d[..i].iter().rposition(|&c| c == b'\n') {
+        let line = k + 1;
+        let digit_at = if d.len() >= line + 3 && d[line..line + 3] == [0xEF, 0xBB, 0xBF] { line + 3 } else { line };
+        if d.get(digit_at).is_some_and(|c| (b'1'..=b'9').contains(c)) {
+            return line;
+        }
+        i = k;
+    }
+    0
+}
+
+/// Reads file bytes start..end (both record starts) in blocks and parses the whole records of each block. Parsing a
+/// block must stop exactly at its last record start, or the part is marked not ok.
+fn read_chunk(f: &File, start: usize, end: usize, j: &Join) -> Part {
+    const BLOCK: usize = 256 << 10;
+    let mut p = Parser::new(j);
+    let mut buf = vec![0u8; BLOCK];
+    let (mut off, mut filled) = (start, 0);
+    loop {
+        if filled == buf.len() {
+            buf.resize(buf.len() * 2, 0); // a record longer than the buffer
+        }
+        let n = (end - off).min(buf.len() - filled);
+        f.read_exact_at(&mut buf[filled..filled + n], off as u64).expect("read input");
+        off += n;
+        filled += n;
+        let upto = if off == end { filled } else { last_record_start(&buf[..filled]) };
+        if upto > 0 {
+            if p.records(&buf[..upto], 0, upto, j) != Some(upto) {
+                let mut part = p.finish(j, 0);
+                part.ok = false;
+                return part;
+            }
+            buf.copy_within(upto..filled, 0);
+            filled -= upto;
+        }
+        if off == end {
+            return p.finish(j, end);
+        }
+    }
 }
 
 /// First record start at or after `from`: just after an LF (and optional BOM) when a digit follows.
@@ -365,6 +427,8 @@ fn main() {
     let (Some(regions), Some(records)) = (map("/data/regions.csv"), map("/data/records.csv")) else {
         std::process::exit(1)
     };
+    // The mapping is only used to find the cut points (a few pages) and by the single-threaded fallback.
+    let file = File::open("/data/records.csv").expect("open records");
 
     // regions.csv: a header line, then "region_id,CCC" lines.
     let mut present = vec![false; 26 * 26 * 26];
@@ -419,8 +483,10 @@ fn main() {
             cut[i] = record_start(records, (first + (end - first) * i / parts).max(cut[i - 1]));
         }
         let done: Vec<Part> = thread::scope(|sc| {
-            let (join, cut) = (&join, &cut);
-            let jobs: Vec<_> = (0..parts).map(|i| sc.spawn(move || parse_chunk(records, cut[i], cut[i + 1], join))).collect();
+            let (join, cut, file) = (&join, &cut, &file);
+            let jobs: Vec<_> = (0..parts)
+                .map(|i| sc.spawn(move || if parts == 1 { parse_chunk(records, cut[i], cut[i + 1], join) } else { read_chunk(file, cut[i], cut[i + 1], join) }))
+                .collect();
             jobs.into_iter().map(|j| j.join().unwrap()).collect()
         });
         // Every chunk must stop exactly where the next one starts, or a boundary was misjudged.
