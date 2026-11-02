@@ -31,6 +31,29 @@ fn map(path: &str) -> Option<&'static [u8]> {
     (p as isize != -1).then(|| unsafe { std::slice::from_raw_parts(p, len) })
 }
 
+/// Multiply-xor hash for the query words (std's SipHash made the query parse take ~30 ms).
+#[derive(Default)]
+struct WordHasher(u64);
+
+impl std::hash::Hasher for WordHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for c in bytes.chunks(8) {
+            let mut w = [0u8; 8];
+            w[..c.len()].copy_from_slice(c);
+            self.0 = (self.0 ^ u64::from_le_bytes(w)).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29);
+        }
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.0 = (self.0 ^ n as u64).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    }
+
+    fn finish(&self) -> u64 {
+        let h = self.0.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+        h ^ (h >> 32)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Op {
     And,
@@ -55,7 +78,7 @@ struct Slot {
 /// open-addressing table, so a lookup is a multiply, a shift and an integer compare. Terms of 17 to 32 bytes
 /// (very rare) are kept in a HashMap. Tokens never contain a zero byte, so zero padding is unambiguous.
 struct Vocab {
-    words: Vec<Vec<u8>>,
+    words: Vec<&'static [u8]>, // slices of the mapped queries file
     slots: Vec<Slot>,
     bits: u32,
     long: HashMap<Vec<u8>, u32>,
@@ -67,7 +90,7 @@ impl Vocab {
         self.slots = vec![Slot::default(); 1 << self.bits];
         for (t, w) in self.words.iter().enumerate() {
             if w.len() > 16 {
-                self.long.insert(w.clone(), t as u32);
+                self.long.insert(w.to_vec(), t as u32);
                 continue;
             }
             let key = w.iter().rev().fold(0u128, |k, &b| k << 8 | u128::from(b));
@@ -380,9 +403,9 @@ fn main() {
 
     // 1. Queries and vocabulary.
     let mut vocab = Vocab { words: Vec::new(), slots: Vec::new(), bits: 0, long: HashMap::new() };
-    let mut queries: Vec<Query> = Vec::new();
+    let mut queries: Vec<Query> = Vec::with_capacity(query_text.iter().filter(|&&c| c == b'\n').count() + 1);
     {
-        let mut ids: HashMap<&[u8], u32> = HashMap::new();
+        let mut ids: HashMap<&[u8], u32, std::hash::BuildHasherDefault<WordHasher>> = HashMap::default();
         for line in query_text.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
             let phrase = line[0] == b'P';
             let body = if phrase { &line[8..line.len() - 1] } else { &line[5..] };
@@ -400,7 +423,7 @@ fn main() {
                     continue;
                 }
                 let t = *ids.entry(w).or_insert_with(|| {
-                    vocab.words.push(w.to_vec());
+                    vocab.words.push(w);
                     vocab.words.len() as u32 - 1
                 });
                 terms.push(t);
