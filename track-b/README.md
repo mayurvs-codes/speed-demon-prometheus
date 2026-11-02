@@ -1,39 +1,45 @@
-> **Owner must rewrite in their own words.** This is a draft written from the tuning log. The rules require a human to understand every optimisation, so read each section, check it against `src/main.rs`, and rewrite it so it is yours.
-
 # Track B: Index
 
-The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/b-index.md).
+The task is in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/b-index.md): a 254 MB corpus of 250,000 documents and 50,000 queries (boolean `AND`/`OR`/`NOT` evaluated strictly left to right, and exact phrases). For each query we print the match count, the sum of the matching ids and the ten smallest ids.
 
-## Approach
+## How it works
 
-All 50,000 queries are known before the corpus is read, so only the terms they mention are indexed (75,747 terms, of which 33,087 appear in phrases). The queries are read first and each distinct term gets an id; the terms go into an open-addressing table where a term of up to 16 bytes is stored inline as two 64-bit integers, so a lookup is a multiply, a shift and two integer compares.
-
-The corpus is cut into 12 slices. Each thread tokenizes its documents with AVX2: 32 bytes are classified at once as token bytes (letters and digits) or separators, and bit tricks give the start and end of every token. A token's key is built with one 16-byte load, lowercased and masked to its length. Every token is looked up in the term table. For each document and query term one (term, document) pair is recorded (or, for very common terms, a bit is set directly in a per-term bitmap, which needs no pairs and no posting list). For phrase terms the thread also stores a 2-byte rank per token position, so a phrase can later be checked in place.
-
-A pair is stored as a 2-byte term id (terms are numbered by falling frequency, so ids past 32,766 are rare and take two u16s), in a buffer reserved from the sampling pass's estimate. Pairs are counting-sorted into per-term posting lists of 16-bit offsets from the slice's first document (slices are in document order, so each list comes out ascending); a slice with more than 65,536 documents makes the scan repeat with twice as many slices. BOOL queries run strictly left to right on a document bitmap: a frequent term is a bitmap AND/OR/ANDNOT over 3,907 words, a rare term touches only its list; an empty result stops early when no OR is left. The count and the id sum come from popcounts, and only the first ten ids are collected bit by bit. PHRASE queries walk the documents of their rarest term and look for the phrase in the stored rank sequences.
+1. **Index only what the queries ask for.** We read the queries first and give each distinct word an id (75,747 terms). A term of up to 16 bytes sits inline in an open-addressing table as two 64-bit numbers, so a lookup is a multiply, a shift and two integer compares.
+2. **Sample, then plan.** A quick pass over the first 1/32 of each thread's slice estimates how many documents contain each term. We use it in three ways:
+   - Terms are renumbered by falling frequency, so the common words' state sits together in cache.
+   - Every term used in a boolean query that appears in at least one bitmap word's worth of documents gets its own bitmap.
+   - Each phrase is anchored on its rarest term.
+3. **Scan in parallel.** The corpus is cut into 12 slices of whole documents. Each thread tokenizes 32 bytes at a time with AVX2: one mask marks letter and digit bytes, and its edges give the start and end of every token. A token's key comes from one 16-byte load, lowercased and masked to its length. A document's tokens are looked up together, after prefetching their table slots, so the cache misses overlap.
+4. **Record matches.** For a frequent term, the document sets a bit in that term's bitmap. For any other term in a boolean query, we record one (term, document) pair as a 2-byte term id; the rare ids above 32,766 take two u16s. Phrases are checked as each document ends, by comparing the term-id sequence around each occurrence of the phrase's anchor.
+5. **Posting lists.** A counting sort turns each thread's pairs into per-term lists of 16-bit offsets from the slice's first document. That works because a slice holds at most 65,536 documents; if one holds more, the scan runs again with twice as many slices.
+6. **Answer.** A boolean query runs left to right on a document bitmap:
+   - A bitmap term is a word-wise AND/OR/AND-NOT.
+   - A list term touches only its own documents.
+   - An empty result stops early when no OR is left.
+   - The count and the id sum come from popcounts, and only the first ten ids are listed one by one.
 
 ## Correctness
 
-The tokenizer follows the spec exactly: ASCII lowercase only, a token is a maximal run of `a-z0-9`, every other byte (including all bytes of 0x80 and above) is a separator, so `Zurich` written with a u-umlaut is two tokens. BOOL has no operator precedence; `NOT` is binary. Phrases ignore punctuation and may cross sentence boundaries but never documents. Terms of 17 to 32 bytes (very rare) are kept in a small `HashMap`. The tag width is generic: `u16` ranks when there are fewer than 65,536 phrase terms, `u32` otherwise, so the answer never depends on the vocabulary size (the `u32` path was forced and tested). Checked with the full-scale and sample hashes and tiny seeds 1 to 60 against `harness/reference/b_index.py`.
+The tokenizer follows the spec: ASCII lowercase only, and a token is a maximal run of `a-z0-9`. Every other byte, including all bytes of 0x80 and above, separates tokens. There is no operator precedence, and `NOT` is binary. Phrases ignore punctuation and may cross sentences but never documents. Terms of 17 to 32 bytes are rare and live in a small `HashMap`. Both fallbacks were forced and tested: the slice re-split, and the two-word encoding for large term ids. We check the full-scale hash, the sample hash and fresh tiny and sample seeds against `harness/reference/b_index.py`.
 
 ## Build and check
 
-Rust, standard library only. The Dockerfile builds offline from an allowlisted image pinned by digest, with `-C target-cpu=x86-64-v3`. The output file is `results.txt`.
+Rust with the standard library only, built offline from allowlisted images pinned by digest, with `-C target-cpu=x86-64-v3`.
 
 ```
 python3 check.py b --data <data folder> --expected f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927
 ```
 
-Full-scale seed-1 output hash: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
-
 ## Dependencies
 
-None. The memory-map calls (`mmap`, `madvise`) are declared directly with `extern "C"` because the standard library has no memory map.
+None. `mmap` and `madvise` are declared with `extern "C"`, because the standard library has no memory map. Pages behind each thread are handed back every 256 KB.
 
 ## Results
 
-On the board: 0.260 s, 111 MB, 64.4 points (`run-95182e864c34`). Earlier local laptop numbers: median 0.61 s to 0.40 s, peak RSS 708 MB to 285 MB. PERF.md has every change with its run.
+On the board: 0.260 s, 111 MB, 64.4 points (`run-95182e864c34`). [PERF.md](PERF.md) lists every change with its board run, including the ones we reverted.
 
-## With another 24 hours
+## Next steps
 
-Bidirectional or sparse BOOL evaluation only pays if the set operations (about 4% of CPU) grow; a pread-based reader would remove most of the kernel time; the phrase phase is memory-latency-bound, so a more compact sequence layout is the next lever.
+The scan is about 70% of the time. The pair buffer (about 24 MB) is still alive while the lists are built, and the per-thread term state is 11 MB. A more compact scan state, and sparse boolean evaluation for queries whose result becomes small, are the next levers.
+
+*These docs were drafted with an AI assistant, which the event rules allow. Every step above maps to a function in `src/main.rs`.*
