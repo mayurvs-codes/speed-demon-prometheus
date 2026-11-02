@@ -86,11 +86,11 @@ impl Vocab {
         ((h ^ (h >> 32)).wrapping_mul(0xFF51_AFD7_ED55_8CCD) >> (64 - bits)) as usize
     }
 
-    /// Looks up a token of at most 16 bytes, given as its two zero-padded 64-bit halves.
+    /// Looks up a token of at most 16 bytes, given as its two zero-padded 64-bit halves, starting at slot `i`
+    /// (its home slot).
     #[inline]
-    fn find(&self, lo: u64, hi: u64) -> Option<u32> {
+    fn find(&self, lo: u64, hi: u64, mut i: usize) -> Option<u32> {
         let mask = (1 << self.bits) - 1;
-        let mut i = Self::home(lo, hi, self.bits);
         loop {
             let s = &self.slots[i];
             if s.id == 0 {
@@ -188,6 +188,7 @@ fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmap
     let mut state: Vec<TermState> = rows.iter().enumerate().map(|(t, &row)| TermState { last_doc: 0, row, pairs: if ph.anchored[t >> 6] >> (t & 63) & 1 == 1 { ANCHOR } else { 0 } }).collect();
     let mut last_match = vec![0u32; ph.terms.len()]; // doc + 1 of the last match per phrase
     let mut ids: Vec<u32> = Vec::new(); // the current document's term ids (u32::MAX for a token no query uses)
+    let mut keys: Vec<(u64, u64, usize)> = Vec::new(); // its tokens before lookup: (key halves, home slot)
     let mut anchors: Vec<usize> = Vec::new(); // positions in `ids` of terms that some phrase is anchored on
     let mut released = at;
     while at < end {
@@ -235,15 +236,20 @@ fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmap
                     continue;
                 }
                 let len = at + b - open; // a token ended just before here
-                let found = if len <= 16 {
+                if len <= 16 {
+                    // Looked up once the document is read; the slot is requested from memory now.
                     let (lo, hi) = unsafe { token_key(d, open, len) };
-                    vocab.find(lo, hi)
-                } else if len <= 32 && !vocab.long.is_empty() {
-                    vocab.long.get(&d[open..at + b].iter().map(|c| c | 0x20).collect::<Vec<u8>>()).copied()
+                    let home = Vocab::home(lo, hi, vocab.bits);
+                    unsafe { _mm_prefetch(vocab.slots.as_ptr().add(home) as *const i8, _MM_HINT_T0) };
+                    keys.push((lo, hi, home));
                 } else {
-                    None
-                };
-                ids.push(found.unwrap_or(u32::MAX));
+                    let found = if len <= 32 && !vocab.long.is_empty() {
+                        vocab.long.get(&d[open..at + b].iter().map(|c| c | 0x20).collect::<Vec<u8>>()).copied()
+                    } else {
+                        None
+                    };
+                    keys.push((u64::from(found.unwrap_or(u32::MAX)), 0, usize::MAX));
+                }
             }
             carry = m >> 31;
             if stop < 32 {
@@ -252,6 +258,14 @@ fn scan(d: &[u8], mut at: usize, end: usize, vocab: &Vocab, rows: &[i32], bitmap
             }
             at += 32;
         }
+        // All of the document's slots are on their way, so these lookups overlap their cache misses.
+        ids.extend(keys.drain(..).map(|(lo, hi, home)| {
+            if home == usize::MAX {
+                lo as u32 // resolved already (a long token)
+            } else {
+                vocab.find(lo, hi, home).unwrap_or(u32::MAX)
+            }
+        }));
         // Record the document's terms, with the state entry a few tokens ahead already on its way from memory.
         for (i, &t) in ids.iter().enumerate() {
             if let Some(&next) = ids.get(i + 8) {
