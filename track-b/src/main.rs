@@ -440,7 +440,7 @@ fn run(vocab: &mut Vocab, queries: &mut [Query]) {
     let n_terms = vocab.words.len();
 
     // 2. Choose the frequent terms. A short sample of each thread's slice estimates document frequencies. A term
-    //    in at least 2 bitmap-words' worth of documents gets a bitmap row that the scan fills directly, so it needs
+    //    in at least 1 bitmap-word's worth of documents gets a bitmap row that the scan fills directly, so it needs
     //    no (term, document) pairs and no posting list.
     let docs = map("/data/docs.txt").unwrap_or(&[]);
     let threads = thread::available_parallelism().map_or(1, |t| t.get()).clamp(1, 12);
@@ -501,7 +501,7 @@ fn run(vocab: &mut Vocab, queries: &mut [Query]) {
     for t in 0..n_terms {
         if !in_bool[t] {
             rows[t] = -2;
-        } else if seen[t] > 0 && seen[t] * n_docs >= 2 * words_per_bitmap * sampled_docs {
+        } else if seen[t] > 0 && seen[t] * n_docs >= words_per_bitmap * sampled_docs {
             rows[t] = n_dense;
             n_dense += 1;
         }

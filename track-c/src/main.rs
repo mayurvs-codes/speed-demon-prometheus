@@ -157,12 +157,13 @@ impl Names {
     }
 }
 
-/// Three records in flight, so each random table access has a record's parsing time to arrive: the newest record's
-/// slot is prefetched, the one before it gets its id and prefetches its bit, and the one before that sets its bit.
+/// Four records in flight, so each random table access has time to arrive: the newest record's slot is prefetched,
+/// two records later it gets its id and prefetches its bit, and one record after that it sets its bit.
 #[derive(Default)]
 struct Pipeline {
-    lookup: Option<(u64, usize)>, // (name hash, country)
-    mark: Option<(usize, usize)>, // (name id, country)
+    waiting: Option<(u64, usize)>, // (name hash, country): slot requested, looked up one record later
+    lookup: Option<(u64, usize)>,  // (name hash, country)
+    mark: Option<(usize, usize)>,  // (name id, country)
 }
 
 impl Pipeline {
@@ -178,7 +179,7 @@ impl Pipeline {
         if let Some((hash, _)) = next {
             names.prefetch_slot(hash);
         }
-        self.lookup = next;
+        self.lookup = std::mem::replace(&mut self.waiting, next);
     }
 }
 
@@ -318,6 +319,7 @@ fn parse_chunk(d: &[u8], mut at: usize, end: usize, j: &Join) -> Part {
         t.cents_max = t.cents_max.max(cents);
         pipeline.push(j.names, Some((name_hash, country)));
     }
+    pipeline.push(j.names, None);
     pipeline.push(j.names, None);
     pipeline.push(j.names, None);
     part.end = at;

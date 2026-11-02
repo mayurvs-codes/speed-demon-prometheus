@@ -13,7 +13,7 @@ use std::thread;
 const HOURS: usize = 72;
 
 /// Bytes read per call; each thread keeps one buffer of this size (plus one partial line).
-const BLOCK: usize = 512 << 10;
+const BLOCK: usize = 256 << 10;
 
 /// Start of the first line that begins at or after `guess`.
 fn line_start(f: &File, guess: u64, len: u64) -> u64 {
