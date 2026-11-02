@@ -17,6 +17,7 @@ Every step from the reference to the final version, each with the live-board run
 | 6 | 8-byte records: the endpoint id, hour and 5xx flag share one `u32` | run-b10da1d9fb74 | 0.0579 | 66.3 | 67.82 |
 | 7 | Remove the `madvise` page release (step 2): the board's M does not count mapped file pages | run-4ee67ae87f66 | 0.0573 | 65.8 | 68.03 |
 | 8 | Compact u32 bucket counters, AtomicU32 error counters, early drop of chunks/pos before formatting, fast hour parsing | TODO | TODO | TODO | |
+| tried | Threads claim 96 pieces of the file from a shared counter instead of one fixed range each (in case some cores run slower). No faster, and 4 MB more memory, so reverted. | `f5395c3` | `run-0d86a81f3223` | 0.0436 | 54.5 | 71.77 |
 
 ## Why each change helped
 
