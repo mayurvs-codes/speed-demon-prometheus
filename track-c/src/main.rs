@@ -135,13 +135,50 @@ impl Names {
         }
     }
 
-    fn mark(&self, hash: u64, country: usize) {
-        let id = self.id(hash);
-        let (word, bit) = (&self.seen[id * self.words + country / 64], 1u64 << (country % 64));
+    /// Starts loading the table entries that `id(hash)` will read first.
+    fn prefetch_slot(&self, hash: u64) {
+        let i = hash.max(1) as usize & (self.slots.len() - 1);
+        unsafe {
+            _mm_prefetch(self.slots.as_ptr().add(i) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(self.ids.as_ptr().add(i) as *const i8, _MM_HINT_T0);
+        }
+    }
+
+    fn word(&self, id: usize, country: usize) -> &AtomicU64 {
+        &self.seen[id * self.words + country / 64]
+    }
+
+    fn mark(&self, id: usize, country: usize) {
+        let (word, bit) = (self.word(id, country), 1u64 << (country % 64));
         // Most pairs repeat: read first so the shared line is written only when the bit is new.
         if word.load(Ordering::Relaxed) & bit == 0 {
             word.fetch_or(bit, Ordering::Relaxed);
         }
+    }
+}
+
+/// Three records in flight, so each random table access has a record's parsing time to arrive: the newest record's
+/// slot is prefetched, the one before it gets its id and prefetches its bit, and the one before that sets its bit.
+#[derive(Default)]
+struct Pipeline {
+    lookup: Option<(u64, usize)>, // (name hash, country)
+    mark: Option<(usize, usize)>, // (name id, country)
+}
+
+impl Pipeline {
+    fn push(&mut self, names: &Names, next: Option<(u64, usize)>) {
+        if let Some((id, country)) = self.mark {
+            names.mark(id, country);
+        }
+        self.mark = self.lookup.map(|(hash, country)| {
+            let id = names.id(hash);
+            unsafe { _mm_prefetch(names.word(id, country) as *const AtomicU64 as *const i8, _MM_HINT_T0) };
+            (id, country)
+        });
+        if let Some((hash, _)) = next {
+            names.prefetch_slot(hash);
+        }
+        self.lookup = next;
     }
 }
 
@@ -225,6 +262,7 @@ fn field(d: &[u8], at: usize, scratch: &mut Vec<u8>, want_hash: bool) -> Option<
 fn parse_chunk(d: &[u8], mut at: usize, end: usize, j: &Join) -> Part {
     let mut part = Part { totals: vec![Totals::NONE; j.countries], end: 0, ok: true };
     let mut scratch = Vec::new();
+    let mut pipeline = Pipeline::default();
     let mut released = at;
     while at < end {
         // Behind us the pages are finished with: hand whole pages back (MADV_DONTNEED drops only this process's
@@ -278,8 +316,10 @@ fn parse_chunk(d: &[u8], mut at: usize, end: usize, j: &Join) -> Part {
         t.cents_sum += cents;
         t.cents_min = t.cents_min.min(cents);
         t.cents_max = t.cents_max.max(cents);
-        j.names.mark(name_hash, country);
+        pipeline.push(j.names, Some((name_hash, country)));
     }
+    pipeline.push(j.names, None);
+    pipeline.push(j.names, None);
     part.end = at;
     part
 }
