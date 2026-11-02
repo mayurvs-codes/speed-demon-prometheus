@@ -166,16 +166,8 @@ fn read_lines(d: &[u8], c: &mut Chunk) {
     }
 }
 
-/// Reads bytes `start..end` (which begin and end on line boundaries) in blocks and reduces them.
-fn read_chunk(f: &File, start: u64, end: u64) -> Chunk {
-    // Lines average ~77 bytes; reserve twice an hour's expected share (pages never written cost no memory).
-    let per_hour = (end - start) as usize / 77 / HOURS * 2 + 64;
-    let mut c = Chunk {
-        lat: (0..HOURS).map(|_| Vec::with_capacity(per_hour)).collect(),
-        ep: (0..HOURS).map(|_| Vec::with_capacity(per_hour)).collect(),
-        dict: Dict::new(),
-    };
-    let mut buf = vec![0u8; BLOCK];
+/// Reads bytes `start..end` (which begin and end on line boundaries) in blocks and adds their lines to `c`.
+fn read_piece(f: &File, start: u64, end: u64, c: &mut Chunk, buf: &mut [u8]) {
     let (mut off, mut filled) = (start, 0);
     loop {
         let n = ((end - off) as usize).min(BLOCK - filled);
@@ -184,11 +176,11 @@ fn read_chunk(f: &File, start: u64, end: u64) -> Chunk {
         filled += n;
         // Only whole lines are reduced; the partial last line moves to the front of the buffer.
         let upto = if off == end { filled } else { buf[..filled].iter().rposition(|&b| b == b'\n').expect("line longer than a block") + 1 };
-        read_lines(&buf[..upto], &mut c);
+        read_lines(&buf[..upto], c);
         buf.copy_within(upto..filled, 0);
         filled -= upto;
         if off == end {
-            return c;
+            return;
         }
     }
 }
@@ -231,14 +223,39 @@ fn main() {
     }
     let threads = thread::available_parallelism().map_or(1, |t| t.get()).clamp(1, 12);
 
-    let mut cut = vec![0u64; threads + 1];
-    cut[threads] = len;
-    for i in 1..threads {
-        cut[i] = line_start(&f, (len * i as u64 / threads as u64).max(cut[i - 1]), len);
+    // The file is cut into 8 pieces per thread and threads claim the next piece when they finish one, so a thread
+    // on a slower or busier core simply takes fewer pieces. The order of lines inside an hour does not matter.
+    let pieces = threads * 8;
+    let mut cut = vec![0u64; pieces + 1];
+    cut[pieces] = len;
+    for i in 1..pieces {
+        cut[i] = line_start(&f, (len * i as u64 / pieces as u64).max(cut[i - 1]), len);
     }
+    let next_piece = AtomicUsize::new(0);
     let chunks: Vec<Chunk> = thread::scope(|sc| {
-        let (cut, f) = (&cut, &f);
-        let jobs: Vec<_> = (0..threads).map(|i| sc.spawn(move || read_chunk(f, cut[i], cut[i + 1]))).collect();
+        let (cut, f, next_piece) = (&cut, &f, &next_piece);
+        let jobs: Vec<_> = (0..threads)
+            .map(|_| {
+                sc.spawn(move || {
+                    // Lines average ~77 bytes; reserve twice an hour's expected share of a thread's bytes (pages never
+                    // written cost no memory).
+                    let per_hour = len as usize / threads / 77 / HOURS * 2 + 64;
+                    let mut c = Chunk {
+                        lat: (0..HOURS).map(|_| Vec::with_capacity(per_hour)).collect(),
+                        ep: (0..HOURS).map(|_| Vec::with_capacity(per_hour)).collect(),
+                        dict: Dict::new(),
+                    };
+                    let mut buf = vec![0u8; BLOCK];
+                    loop {
+                        let i = next_piece.fetch_add(1, Ordering::Relaxed);
+                        if i >= pieces {
+                            return c;
+                        }
+                        read_piece(f, cut[i], cut[i + 1], &mut c, &mut buf);
+                    }
+                })
+            })
+            .collect();
         jobs.into_iter().map(|j| j.join().unwrap()).collect()
     });
 

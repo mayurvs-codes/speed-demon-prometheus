@@ -265,6 +265,7 @@ fn parse_chunk(d: &[u8], mut at: usize, end: usize, j: &Join) -> Part {
         }
         at += 1;
         let Some((stop, name_len, name_hash)) = field(d, at, &mut scratch, true) else { part.ok = false; return part };
+        j.names.prefetch_slot(name_hash); // on its way while the rest of the record is parsed
         at = stop + 1;
         let Some((stop, note_len, _)) = field(d, at, &mut scratch, false) else { part.ok = false; return part };
         at = stop + 1;
@@ -274,6 +275,9 @@ fn parse_chunk(d: &[u8], mut at: usize, end: usize, j: &Join) -> Part {
             at += 1;
         }
         at += 1;
+        if let Some(c) = j.country8.get(region) {
+            unsafe { _mm_prefetch(c as *const u8 as *const i8, _MM_HINT_T0) };
+        }
         let negative = d[at] == b'-';
         at += usize::from(negative);
         let mut cents = 0i64;
